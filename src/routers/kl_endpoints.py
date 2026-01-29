@@ -1,0 +1,68 @@
+from fastapi import APIRouter, Depends
+import aiomysql
+
+from src.resources.mysql import async_get_db
+from src.model.kl_models import (
+    LoginData,
+    LoginRequest,
+    LoginResponse,
+    MenuItemsRequest,
+    MenuItemsResponse,
+)
+from src.services.kl_service import (
+    authenticate_user_async,
+    fetch_active_menu_items_async,
+    health_status,
+    say_hello,
+)
+
+api_router = APIRouter()
+
+
+@api_router.get("/")
+async def root():
+    return {"message": "Hello World"}
+
+
+@api_router.get("/hello/{name}")
+async def hello(name: str):
+    return {"message": say_hello(name)}
+
+
+@api_router.get("/health")
+async def health():
+    return health_status()
+
+
+@api_router.post("/api/login", tags=["auth"], response_model=LoginResponse)
+async def login(
+    payload: LoginRequest,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    user = await authenticate_user_async(
+        db,
+        email=payload.email,
+        password=payload.password,
+    )
+    if user is None:
+        return LoginResponse(
+            code=401,
+            message="Invalid credentials",
+        )
+    return LoginResponse(
+        code=0,
+        data=LoginData(
+            emp_id=user["emp_id"],
+            email=user["email"],
+        ),
+        message="OK",
+    )
+
+
+@api_router.post("/api/menu_items", tags=["menus"], response_model=MenuItemsResponse)
+async def get_menu_items(
+    payload: MenuItemsRequest,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    items = await fetch_active_menu_items_async(db, emp_id=payload.emp_id)
+    return MenuItemsResponse(items=items)
