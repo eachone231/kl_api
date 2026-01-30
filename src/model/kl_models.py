@@ -18,6 +18,39 @@ class MenuItemsRequest(BaseModel):
     emp_id: str
 
 
+class Project(BaseModel):
+    id: int
+    name: str
+    owner: str | None = None
+    memo: str | None = None
+
+
+class ProjectsResponse(BaseModel):
+    items: list[Project]
+
+
+class Cabinet(BaseModel):
+    id: int
+    project_id: int
+    uuid: str
+    name: str
+    storage_type: str
+    storage_root_path: str
+    storage_path: str | None = None
+    vector_store: str | None = None
+    collection_name: str | None = None
+    embedding_model_name: str | None = None
+    embedding_dim: int | None = None
+
+
+class CabinetsResponse(BaseModel):
+    items: list[Cabinet]
+
+
+class CabinetResponse(BaseModel):
+    item: Cabinet
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -25,6 +58,7 @@ class LoginRequest(BaseModel):
 
 class LoginData(BaseModel):
     emp_id: str
+    username: str
     email: str
 
 
