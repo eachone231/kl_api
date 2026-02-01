@@ -1,4 +1,6 @@
 # schemas/menu.py
+from datetime import datetime
+
 from pydantic import BaseModel
 
 
@@ -33,6 +35,7 @@ class Cabinet(BaseModel):
     id: int
     project_id: int
     uuid: str
+    cabinet_uuid: str
     name: str
     storage_type: str
     storage_root_path: str
@@ -66,3 +69,34 @@ class LoginResponse(BaseModel):
     code: int
     data: LoginData | None = None
     message: str | None = None
+
+
+class PageInfo(BaseModel):
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+
+
+class DocumentListItem(BaseModel):
+    id: str
+    file_name: str
+    file_type: str
+    file_size: int
+    status: str
+    processing_step: str | None = None
+    uploaded_at: datetime | None = None
+
+
+class DocumentsResponse(BaseModel):
+    items: list[DocumentListItem]
+    page_info: PageInfo
+
+
+class DocumentSummaryResponse(BaseModel):
+    total: int
+    by_status: dict[str, int]
+
+
+class UploadDocumentsResponse(BaseModel):
+    items: list[DocumentListItem]
