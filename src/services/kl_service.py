@@ -723,6 +723,88 @@ async def fetch_documents_summary_async(
     return total, by_status
 
 
+async def fetch_cabinet_chunking_settings_async(
+    db,
+    cabinet_uuid: str,
+) -> tuple[bool, "ChunkingConfig | None", "ChunkingRun | None", list["ChunkingConfig"]]:
+    import aiomysql
+
+    from src.model.kl_models import ChunkingConfig, ChunkingRun
+
+    cabinet_qry = """
+    SELECT id
+    FROM cabinets
+    WHERE cabinet_uuid = %(cabinet_uuid)s
+    LIMIT 1
+    """
+    configs_qry = """
+    SELECT
+        id,
+        method_name,
+        chunk_size,
+        chunk_overlap,
+        unit,
+        splitter_version,
+        memo
+    FROM chunking_configs
+    ORDER BY id
+    """
+    current_config_qry = """
+    SELECT
+        id,
+        method_name,
+        chunk_size,
+        chunk_overlap,
+        unit,
+        splitter_version,
+        memo
+    FROM chunking_configs
+    WHERE id = %(config_id)s
+    LIMIT 1
+    """
+    current_run_qry = """
+    SELECT
+        id,
+        chunking_config_id,
+        chunk_size,
+        chunk_overlap,
+        unit,
+        splitter_version,
+        memo,
+        created_at,
+        updated_at
+    FROM chunking_runs
+    WHERE cabinet_uuid = %(cabinet_uuid)s
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
+    """
+
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(cabinet_qry, {"cabinet_uuid": cabinet_uuid})
+        cabinet_row = await cursor.fetchone()
+        if cabinet_row is None:
+            return False, None, None, []
+
+        await cursor.execute(configs_qry)
+        configs_rows = await cursor.fetchall()
+
+        current_config = None
+        current_run = None
+        await cursor.execute(current_run_qry, {"cabinet_uuid": cabinet_uuid})
+        row = await cursor.fetchone()
+        if row:
+            current_run = ChunkingRun(**row)
+            config_id = row.get("chunking_config_id")
+            if config_id:
+                await cursor.execute(current_config_qry, {"config_id": config_id})
+                config_row = await cursor.fetchone()
+                if config_row:
+                    current_config = ChunkingConfig(**config_row)
+
+    configs = [ChunkingConfig(**row) for row in configs_rows]
+    return True, current_config, current_run, configs
+
+
 _DOCUMENTS_CABINET_FILTER: tuple[str, str] | None = None
 _DOCUMENTS_COLUMNS: dict[str, dict[str, str | None]] | None = None
 _CABINETS_COLUMNS: dict[str, dict[str, str | None]] | None = None

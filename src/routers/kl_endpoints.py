@@ -5,6 +5,7 @@ from src.resources.mysql import async_get_db
 from src.model.kl_models import (
     CabinetsResponse,
     CabinetResponse,
+    CabinetChunkingSettingsResponse,
     DocumentSummaryResponse,
     DocumentsResponse,
     LoginData,
@@ -25,6 +26,7 @@ from src.services.kl_service import (
     health_status,
     fetch_documents_async,
     fetch_documents_summary_async,
+    fetch_cabinet_chunking_settings_async,
     save_uploaded_documents_async,
     say_hello,
 )
@@ -215,3 +217,28 @@ async def upload_documents(
         raise HTTPException(status_code=404, detail="Cabinet not found")
     items = await save_uploaded_documents_async(db, cabinet=cabinet, files=files)
     return UploadDocumentsResponse(items=items)
+
+
+@api_router.get(
+    "/api/cabinets/chunking",
+    tags=["chunking"],
+    response_model=CabinetChunkingSettingsResponse,
+)
+async def get_cabinet_chunking_settings(
+    cabinet_uuid: str = Query(..., min_length=1),
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    exists, current_config, current_run, configs = (
+        await fetch_cabinet_chunking_settings_async(
+            db,
+            cabinet_uuid=cabinet_uuid,
+        )
+    )
+    if not exists:
+        raise HTTPException(status_code=404, detail="Cabinet not found")
+    return CabinetChunkingSettingsResponse(
+        cabinet_uuid=cabinet_uuid,
+        current_config=current_config,
+        current_run=current_run,
+        configs=configs,
+    )

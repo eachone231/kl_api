@@ -14,7 +14,7 @@ POST http://127.0.0.1:8000/api/login
 Content-Type: application/json
 
 {
-  "email": "qa1@example.com",
+  "email": "super1@example.com",
   "password": "pw123!"
 }
 

@@ -100,3 +100,32 @@ class DocumentSummaryResponse(BaseModel):
 
 class UploadDocumentsResponse(BaseModel):
     items: list[DocumentListItem]
+
+
+class ChunkingConfig(BaseModel):
+    id: int
+    method_name: str | None = None
+    chunk_size: int | None = None
+    chunk_overlap: int | None = None
+    unit: str | None = None
+    splitter_version: str | None = None
+    memo: str | None = None
+
+
+class ChunkingRun(BaseModel):
+    id: int
+    chunking_config_id: int
+    chunk_size: int | None = None
+    chunk_overlap: int | None = None
+    unit: str | None = None
+    splitter_version: str | None = None
+    memo: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class CabinetChunkingSettingsResponse(BaseModel):
+    cabinet_uuid: str
+    current_config: ChunkingConfig | None = None
+    current_run: ChunkingRun | None = None
+    configs: list[ChunkingConfig]
