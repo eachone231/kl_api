@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     db_user: str = "root"
     db_pwd: str = ""
     db_name: str = "kl_api"
+    db_auth_plugin: str | None = None
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -49,7 +50,7 @@ settings = Settings()
 
 
 def build_mysql_aiomysql_config() -> dict[str, object]:
-    return {
+    config = {
         "host": settings.db_host,
         "port": settings.db_port,
         "user": settings.db_user,
@@ -57,3 +58,6 @@ def build_mysql_aiomysql_config() -> dict[str, object]:
         "db": settings.db_name,
         "charset": "utf8mb4",
     }
+    if settings.db_auth_plugin:
+        config["auth_plugin"] = settings.db_auth_plugin
+    return config

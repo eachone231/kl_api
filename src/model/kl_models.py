@@ -1,7 +1,7 @@
 # schemas/menu.py
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class MenuItems(BaseModel):
@@ -124,8 +124,28 @@ class ChunkingRun(BaseModel):
     updated_at: datetime | None = None
 
 
+class ChunkingRunCreate(BaseModel):
+    chunking_config_id: int
+    chunk_size: int
+    chunk_overlap: int
+    unit: str
+    splitter_version: str | None = None
+    memo: str | None = None
+
+
+class CabinetChunkingRunRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    cabinet_uuid: str
+    chunking_run: ChunkingRunCreate = Field(..., alias="chinking_run")
+
+
+class CabinetChunkingRunResponse(BaseModel):
+    cabinet_uuid: str
+    chunking_run: ChunkingRun
+
+
 class CabinetChunkingSettingsResponse(BaseModel):
     cabinet_uuid: str
-    current_config: ChunkingConfig | None = None
     current_run: ChunkingRun | None = None
     configs: list[ChunkingConfig]

@@ -726,7 +726,7 @@ async def fetch_documents_summary_async(
 async def fetch_cabinet_chunking_settings_async(
     db,
     cabinet_uuid: str,
-) -> tuple[bool, "ChunkingConfig | None", "ChunkingRun | None", list["ChunkingConfig"]]:
+) -> tuple[bool, "ChunkingRun | None", list["ChunkingConfig"]]:
     import aiomysql
 
     from src.model.kl_models import ChunkingConfig, ChunkingRun
@@ -749,23 +749,11 @@ async def fetch_cabinet_chunking_settings_async(
     FROM chunking_configs
     ORDER BY id
     """
-    current_config_qry = """
-    SELECT
-        id,
-        method_name,
-        chunk_size,
-        chunk_overlap,
-        unit,
-        splitter_version,
-        memo
-    FROM chunking_configs
-    WHERE id = %(config_id)s
-    LIMIT 1
-    """
     current_run_qry = """
     SELECT
         id,
         chunking_config_id,
+        cabinet_uuid,
         chunk_size,
         chunk_overlap,
         unit,
@@ -783,26 +771,97 @@ async def fetch_cabinet_chunking_settings_async(
         await cursor.execute(cabinet_qry, {"cabinet_uuid": cabinet_uuid})
         cabinet_row = await cursor.fetchone()
         if cabinet_row is None:
-            return False, None, None, []
+            return False, None, []
 
         await cursor.execute(configs_qry)
         configs_rows = await cursor.fetchall()
 
-        current_config = None
         current_run = None
         await cursor.execute(current_run_qry, {"cabinet_uuid": cabinet_uuid})
         row = await cursor.fetchone()
         if row:
             current_run = ChunkingRun(**row)
-            config_id = row.get("chunking_config_id")
-            if config_id:
-                await cursor.execute(current_config_qry, {"config_id": config_id})
-                config_row = await cursor.fetchone()
-                if config_row:
-                    current_config = ChunkingConfig(**config_row)
 
     configs = [ChunkingConfig(**row) for row in configs_rows]
-    return True, current_config, current_run, configs
+    return True, current_run, configs
+
+
+async def create_cabinet_chunking_run_async(
+    db,
+    cabinet_uuid: str,
+    chunking_run: "ChunkingRunCreate",
+) -> tuple[bool, "ChunkingRun | None"]:
+    import aiomysql
+    from datetime import datetime
+
+    from src.model.kl_models import ChunkingRun
+
+    cabinet_qry = """
+    SELECT id
+    FROM cabinets
+    WHERE cabinet_uuid = %(cabinet_uuid)s
+    LIMIT 1
+    """
+    insert_qry = """
+    INSERT INTO chunking_runs (
+        chunking_config_id,
+        cabinet_uuid,
+        chunk_size,
+        chunk_overlap,
+        unit,
+        splitter_version,
+        memo
+    ) VALUES (
+        %(chunking_config_id)s,
+        %(cabinet_uuid)s,
+        %(chunk_size)s,
+        %(chunk_overlap)s,
+        %(unit)s,
+        %(splitter_version)s,
+        %(memo)s
+    )
+    """
+    select_qry = """
+    SELECT
+        id,
+        chunking_config_id,
+        cabinet_uuid,
+        chunk_size,
+        chunk_overlap,
+        unit,
+        splitter_version,
+        memo,
+        created_at,
+        updated_at
+    FROM chunking_runs
+    WHERE cabinet_uuid = %(cabinet_uuid)s
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
+    """
+
+    params = {
+        "chunking_config_id": chunking_run.chunking_config_id,
+        "cabinet_uuid": cabinet_uuid,
+        "chunk_size": chunking_run.chunk_size,
+        "chunk_overlap": chunking_run.chunk_overlap,
+        "unit": chunking_run.unit,
+        "splitter_version": chunking_run.splitter_version,
+        "memo": chunking_run.memo,
+    }
+
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(cabinet_qry, {"cabinet_uuid": cabinet_uuid})
+        cabinet_row = await cursor.fetchone()
+        if cabinet_row is None:
+            return False, None
+
+        await cursor.execute(insert_qry, params)
+        await cursor.execute(select_qry, {"cabinet_uuid": cabinet_uuid})
+        row = await cursor.fetchone()
+
+    if not row:
+        return True, None
+    return True, ChunkingRun(**row)
 
 
 _DOCUMENTS_CABINET_FILTER: tuple[str, str] | None = None

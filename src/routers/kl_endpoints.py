@@ -5,6 +5,8 @@ from src.resources.mysql import async_get_db
 from src.model.kl_models import (
     CabinetsResponse,
     CabinetResponse,
+    CabinetChunkingRunRequest,
+    CabinetChunkingRunResponse,
     CabinetChunkingSettingsResponse,
     DocumentSummaryResponse,
     DocumentsResponse,
@@ -26,6 +28,7 @@ from src.services.kl_service import (
     health_status,
     fetch_documents_async,
     fetch_documents_summary_async,
+    create_cabinet_chunking_run_async,
     fetch_cabinet_chunking_settings_async,
     save_uploaded_documents_async,
     say_hello,
@@ -219,8 +222,34 @@ async def upload_documents(
     return UploadDocumentsResponse(items=items)
 
 
+@api_router.post(
+    "/api/cabinet/chunking",
+    tags=["chunking"],
+    response_model=CabinetChunkingRunResponse,
+)
+async def create_cabinet_chunking_run(
+    payload: CabinetChunkingRunRequest,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    exists, chunking_run = await create_cabinet_chunking_run_async(
+        db,
+        cabinet_uuid=payload.cabinet_uuid,
+        chunking_run=payload.chunking_run,
+    )
+    if not exists:
+        raise HTTPException(status_code=404, detail="Cabinet not found")
+    if chunking_run is None:
+        raise HTTPException(
+            status_code=500, detail="Failed to create chunking run"
+        )
+    return CabinetChunkingRunResponse(
+        cabinet_uuid=payload.cabinet_uuid,
+        chunking_run=chunking_run,
+    )
+
+
 @api_router.get(
-    "/api/cabinets/chunking",
+    "/api/cabinet/chunking",
     tags=["chunking"],
     response_model=CabinetChunkingSettingsResponse,
 )
@@ -228,7 +257,7 @@ async def get_cabinet_chunking_settings(
     cabinet_uuid: str = Query(..., min_length=1),
     db: aiomysql.Connection = Depends(async_get_db),
 ):
-    exists, current_config, current_run, configs = (
+    exists, current_run, configs = (
         await fetch_cabinet_chunking_settings_async(
             db,
             cabinet_uuid=cabinet_uuid,
@@ -238,7 +267,6 @@ async def get_cabinet_chunking_settings(
         raise HTTPException(status_code=404, detail="Cabinet not found")
     return CabinetChunkingSettingsResponse(
         cabinet_uuid=cabinet_uuid,
-        current_config=current_config,
         current_run=current_run,
         configs=configs,
     )
