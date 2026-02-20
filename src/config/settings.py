@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +25,23 @@ class Settings(BaseSettings):
     db_pwd: str = ""
     db_name: str = "kl_api"
     db_auth_plugin: str | None = None
+    smtp_host: str = Field("smtp.gmail.com", validation_alias="SMTP_HOST")
+    smtp_port: int = Field(587, validation_alias="SMTP_PORT")
+    smtp_user: str | None = Field(None, validation_alias="SMTP_USER")
+    smtp_pass: str | None = Field(None, validation_alias="SMTP_PASS")
+    smtp_from: str | None = Field(None, validation_alias="SMTP_FROM")
+    smtp_use_tls: bool = Field(True, validation_alias="SMTP_USE_TLS")
+    reset_base_url: str | None = Field(None, validation_alias="RESET_BASE_URL")
+    redis_url: str | None = Field(None, validation_alias="REDIS_URL")
+    redis_cluster_mode: int = Field(0, validation_alias="REDIS_CLUSTER_MODE")
+    redis_host: str = Field("127.0.0.1", validation_alias="REDIS_HOST")
+    redis_port: int = Field(6379, validation_alias="REDIS_PORT")
+    redis_pwd: str | None = Field(None, validation_alias="REDIS_PWD")
+    redis_queue: str = Field("document_pipeline", validation_alias="REDIS_QUEUE")
+    redis_stream: str = Field("document_pipeline", validation_alias="REDIS_STREAM")
+    redis_stream_maxlen: int | None = Field(
+        None, validation_alias="REDIS_STREAM_MAXLEN"
+    )
 
     @field_validator("cors_origins", mode="before")
     @classmethod

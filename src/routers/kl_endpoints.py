@@ -1,4 +1,14 @@
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    Request,
+)
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 import aiomysql
 
@@ -6,6 +16,8 @@ from src.resources.mysql import async_get_db
 from src.model.kl_models import (
     CabinetsResponse,
     CabinetResponse,
+    CabinetDeleteRequest,
+    CabinetDeleteResponse,
     CabinetChunkingRunRequest,
     CabinetChunkingRunResponse,
     CabinetChunkingSettingsResponse,
@@ -27,6 +39,12 @@ from src.model.kl_models import (
     LoginResponse,
     ModelsResponse,
     ModelsSummaryResponse,
+    SystemProfilesResponse,
+    SystemProfileCreateRequest,
+    SystemProfileResponse,
+    SystemProfileDeleteRequest,
+    SystemProfileDeleteResponse,
+    SystemProfileUpdateRequest,
     ModelUpdateRequest,
     ModelConfigRequest,
     ModelConfigResponse,
@@ -60,6 +78,14 @@ from src.model.kl_models import (
     SystemEnvironmentsResponse,
     SystemSecretProvidersResponse,
     UploadDocumentsResponse,
+    UserCreateRequest,
+    UserResponse,
+    UserResetRequest,
+    UserResetResponse,
+    UserResetConfirmRequest,
+    UserResetConfirmResponse,
+    EnquerySummaryResponse,
+    EnqueryListResponse,
 )
 from src.services.kl_service import (
     authenticate_user_async,
@@ -70,6 +96,12 @@ from src.services.kl_service import (
     fetch_active_projects_async,
     fetch_models_async,
     fetch_models_summary_async,
+    fetch_system_profiles_async,
+    create_system_profile_async,
+    delete_system_profile_async,
+    update_system_profile_async,
+    deactivate_system_profile_async,
+    activate_system_profile_async,
     update_model_deprecated_async,
     fetch_model_configs_async,
     create_llm_model_config_async,
@@ -104,11 +136,21 @@ from src.services.kl_service import (
     create_qa_evaluation_async,
     create_cabinet_async,
     update_cabinet_async,
+    activate_cabinet_async,
+    deactivate_cabinet_async,
+    delete_cabinet_async,
     fetch_cabinet_document_summary_async,
     fetch_chunks_async,
     save_uploaded_documents_async,
     say_hello,
+    create_user_async,
+    create_user_reset_token_async,
+    confirm_user_reset_token_async,
+    fetch_enquery_summary_async,
+    fetch_enqueries_async,
+    enqueue_document_pipeline_async,
 )
+from src.resources.redis import get_redis_client
 
 api_router = APIRouter()
 
@@ -133,12 +175,17 @@ async def login(
     payload: LoginRequest,
     db: aiomysql.Connection = Depends(async_get_db),
 ):
-    user = await authenticate_user_async(
+    user, reason = await authenticate_user_async(
         db,
         email=payload.email,
         password=payload.password,
     )
     if user is None:
+        if reason == "inactive":
+            return LoginResponse(
+                code=403,
+                message="승인 대기중",
+            )
         return LoginResponse(
             code=401,
             message="Invalid credentials",
@@ -152,6 +199,92 @@ async def login(
         ),
         message="OK",
     )
+
+
+@api_router.post("/api/user", tags=["users"], response_model=UserResponse)
+async def create_user(
+    payload: UserCreateRequest,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    ok, user, reason = await create_user_async(db, payload=payload)
+    if not ok:
+        if reason == "emp_id":
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "이미 등록된 사원번호"},
+            )
+        if reason == "email":
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "이미 등록된 이메일"},
+            )
+        if reason in {"emp_id,email", "email,emp_id"}:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "이미 등록된 사용자"},
+            )
+        raise HTTPException(
+            status_code=500,
+            detail={"message": reason or "unknown"},
+        )
+    return UserResponse(item=user)
+
+
+@api_router.post(
+    "/api/user/reset",
+    tags=["users"],
+    response_model=UserResetResponse,
+)
+async def create_user_reset(
+    payload: UserResetRequest,
+    request: Request,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    ip_address = request.client.host if request.client else None
+    ok, data, reason = await create_user_reset_token_async(
+        db, payload=payload, ip_address=ip_address
+    )
+    if not ok:
+        if reason == "user_not_found":
+            raise HTTPException(
+                status_code=404, detail={"message": "User not found"}
+            )
+        raise HTTPException(
+            status_code=500, detail={"message": reason or "unknown"}
+        )
+    return UserResetResponse(
+        token=data["token"],
+        expires_at=data["expires_at"],
+    )
+
+
+@api_router.post(
+    "/api/user/reset/confirm",
+    tags=["users"],
+    response_model=UserResetConfirmResponse,
+)
+async def confirm_user_reset(
+    payload: UserResetConfirmRequest,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    ok, reason = await confirm_user_reset_token_async(db, payload=payload)
+    if not ok:
+        if reason in {"invalid_token", "user_not_found"}:
+            raise HTTPException(
+                status_code=404, detail={"message": "Invalid token"}
+            )
+        if reason == "token_expired":
+            raise HTTPException(
+                status_code=410, detail={"message": "Token expired"}
+            )
+        if reason == "token_used":
+            raise HTTPException(
+                status_code=409, detail={"message": "Token already used"}
+            )
+        raise HTTPException(
+            status_code=500, detail={"message": reason or "unknown"}
+        )
+    return UserResetConfirmResponse(reset=True)
 
 
 @api_router.post("/api/menu_items", tags=["menus"], response_model=MenuItemsResponse)
@@ -284,6 +417,184 @@ async def get_models_summary(
 ):
     summary = await fetch_models_summary_async(db)
     return ModelsSummaryResponse(**summary)
+
+
+@api_router.get(
+    "/api/enquery/summary",
+    tags=["enquery"],
+    response_model=EnquerySummaryResponse,
+)
+async def get_enquery_summary(
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    summary = await fetch_enquery_summary_async(db)
+    return EnquerySummaryResponse(**summary)
+
+
+@api_router.get(
+    "/api/enqueries",
+    tags=["enquery"],
+    response_model=EnqueryListResponse,
+)
+async def get_enqueries(
+    page: int = Query(
+        1,
+        ge=1,
+        description="Page number for pagination (1-based).",
+    ),
+    page_size: int = Query(
+        10,
+        ge=1,
+        le=100,
+        description="Page size for pagination (max 100).",
+    ),
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    items, total_items = await fetch_enqueries_async(
+        db,
+        page=page,
+        page_size=page_size,
+    )
+    total_pages = (
+        (total_items + page_size - 1) // page_size if total_items else 0
+    )
+    return EnqueryListResponse(
+        items=items,
+        page_info={
+            "page": page,
+            "page_size": page_size,
+            "total_items": total_items,
+            "total_pages": total_pages,
+        },
+    )
+
+
+@api_router.get(
+    "/api/model/system_profile",
+    tags=["models"],
+    response_model=SystemProfilesResponse,
+)
+async def get_system_profiles(
+    is_active: bool | None = Query(
+        None,
+        description="Filter profiles by active status.",
+    ),
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    items = await fetch_system_profiles_async(db, is_active=is_active)
+    return SystemProfilesResponse(items=items)
+
+
+@api_router.post(
+    "/api/model/system_profile",
+    tags=["models"],
+    response_model=SystemProfileResponse,
+)
+async def create_system_profile(
+    payload: SystemProfileCreateRequest,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    try:
+        item = await create_system_profile_async(db, payload=payload)
+    except aiomysql.IntegrityError:
+        raise HTTPException(
+            status_code=409, detail="System profile already exists"
+        )
+    return SystemProfileResponse(item=item)
+
+
+@api_router.delete(
+    "/api/model/system_profile",
+    tags=["models"],
+    response_model=SystemProfileDeleteResponse,
+)
+async def delete_system_profile(
+    payload: SystemProfileDeleteRequest,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    deleted = await delete_system_profile_async(
+        db, system_profile_id=payload.id
+    )
+    if not deleted:
+        raise HTTPException(
+            status_code=404, detail="System profile not found"
+        )
+    return SystemProfileDeleteResponse(deleted=True)
+
+
+@api_router.put(
+    "/api/model/system_profile",
+    tags=["models"],
+    response_model=SystemProfileResponse,
+)
+async def update_system_profile(
+    payload: SystemProfileUpdateRequest,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    exists, item = await update_system_profile_async(db, payload=payload)
+    if not exists:
+        raise HTTPException(
+            status_code=404, detail={"message": "System profile not found"}
+        )
+    if item is None:
+        raise HTTPException(
+            status_code=500,
+            detail={"message": "Failed to update system profile"},
+        )
+    return SystemProfileResponse(item=item)
+
+
+@api_router.patch(
+    "/api/model/system_profile/{system_profile_id}/deactivate",
+    tags=["models"],
+    response_model=SystemProfileResponse,
+)
+async def deactivate_system_profile(
+    system_profile_id: int,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    exists, item, cabinets, reason = await deactivate_system_profile_async(
+        db, system_profile_id=system_profile_id
+    )
+    if not exists:
+        raise HTTPException(status_code=404, detail="System profile not found")
+    if reason == "has_active_cabinets":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "System profile has active cabinets",
+                "cabinets": jsonable_encoder(cabinets),
+            },
+        )
+    if item is None:
+        raise HTTPException(
+            status_code=500, detail="Failed to update system profile"
+        )
+    return SystemProfileResponse(item=item)
+
+
+@api_router.patch(
+    "/api/model/system_profile/{system_profile_id}/activate",
+    tags=["models"],
+    response_model=SystemProfileResponse,
+)
+async def activate_system_profile(
+    system_profile_id: int,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    exists, item, reason = await activate_system_profile_async(
+        db, system_profile_id=system_profile_id
+    )
+    if not exists:
+        raise HTTPException(
+            status_code=404, detail={"message": "System profile not found"}
+        )
+    if item is None:
+        raise HTTPException(
+            status_code=500,
+            detail={"message": "Failed to update system profile"},
+        )
+    return SystemProfileResponse(item=item)
 
 
 @api_router.patch("/api/model", tags=["models"], response_model=ModelsResponse)
@@ -607,7 +918,7 @@ async def create_cabinet(
 ):
     ok, cabinet = await create_cabinet_async(db, payload=payload)
     if not ok:
-        raise HTTPException(status_code=404, detail="Embedding model not found")
+        raise HTTPException(status_code=404, detail="System profile not found")
     if cabinet is None:
         raise HTTPException(status_code=500, detail="Failed to create cabinet")
     return CabinetResponse(item=cabinet)
@@ -618,12 +929,97 @@ async def update_cabinet(
     payload: CabinetUpdateRequest,
     db: aiomysql.Connection = Depends(async_get_db),
 ):
-    exists, cabinet = await update_cabinet_async(db, payload=payload)
+    exists, cabinet, reason = await update_cabinet_async(db, payload=payload)
     if not exists:
+        if reason == "system_profile_missing":
+            raise HTTPException(
+                status_code=404, detail="System profile not found"
+            )
         raise HTTPException(status_code=404, detail="Cabinet not found")
     if cabinet is None:
         raise HTTPException(
             status_code=500, detail="Failed to update cabinet"
+        )
+    return CabinetResponse(item=cabinet)
+
+
+@api_router.delete(
+    "/api/cabinet",
+    tags=["cabinets"],
+    response_model=CabinetDeleteResponse,
+)
+async def delete_cabinet(
+    payload: CabinetDeleteRequest,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    deleted, reason = await delete_cabinet_async(
+        db, cabinet_uuid=payload.cabinet_uuid
+    )
+    if not deleted:
+        if reason == "not_found":
+            raise HTTPException(status_code=404, detail="Cabinet not found")
+        if reason == "has_documents":
+            raise HTTPException(
+                status_code=409, detail="Cabinet has documents"
+            )
+        raise HTTPException(status_code=500, detail="Failed to delete cabinet")
+    return CabinetDeleteResponse(deleted=True)
+
+
+@api_router.patch(
+    "/api/cabinet/{cabinet_uuid}/activate",
+    tags=["cabinets"],
+    response_model=CabinetResponse,
+)
+async def activate_cabinet(
+    cabinet_uuid: str,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    exists, cabinet, system_profile, reason = await activate_cabinet_async(
+        db, cabinet_uuid=cabinet_uuid
+    )
+    if not exists:
+        raise HTTPException(
+            status_code=404, detail={"message": "Cabinet not found"}
+        )
+    if reason == "system_profile_missing":
+        raise HTTPException(
+            status_code=404, detail={"message": "System profile not found"}
+        )
+    if reason == "system_profile_inactive":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "System profile is inactive",
+                "system_profile": jsonable_encoder(system_profile),
+            },
+        )
+    if cabinet is None:
+        raise HTTPException(
+            status_code=500, detail={"message": "Failed to update cabinet"}
+        )
+    return CabinetResponse(item=cabinet)
+
+
+@api_router.patch(
+    "/api/cabinet/{cabinet_uuid}/deactivate",
+    tags=["cabinets"],
+    response_model=CabinetResponse,
+)
+async def deactivate_cabinet(
+    cabinet_uuid: str,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    exists, cabinet, reason = await deactivate_cabinet_async(
+        db, cabinet_uuid=cabinet_uuid
+    )
+    if not exists:
+        raise HTTPException(
+            status_code=404, detail={"message": "Cabinet not found"}
+        )
+    if cabinet is None:
+        raise HTTPException(
+            status_code=500, detail={"message": "Failed to update cabinet"}
         )
     return CabinetResponse(item=cabinet)
 
@@ -995,6 +1391,18 @@ async def upload_documents(
     if cabinet is None:
         raise HTTPException(status_code=404, detail="Cabinet not found")
     items = await save_uploaded_documents_async(db, cabinet=cabinet, files=files)
+    try:
+        redis_client = await get_redis_client()
+        await enqueue_document_pipeline_async(
+            redis_client,
+            cabinet_uuid=cabinet.cabinet_uuid,
+            items=items,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to enqueue documents: {exc}",
+        ) from exc
     return UploadDocumentsResponse(items=items)
 
 

@@ -32,3 +32,65 @@ Content-Type: application/json
     "unit": "char"
   }
 }
+
+###
+
+GET http://127.0.0.1:8000/api/model/system_profile?is_active=true
+Accept: application/json
+
+###
+
+POST http://127.0.0.1:8000/api/cabinet
+Content-Type: application/json
+
+{
+  "project_id": 1,
+  "name": "example cabinet",
+  "storage_type": "local",
+  "storage_base_path": "/data",
+  "storage_path": "uploads",
+  "vector_store": "faiss",
+  "collection_name": "collection_1",
+  "system_profile_id": 1
+}
+
+###
+
+PUT http://127.0.0.1:8000/api/cabinet
+Content-Type: application/json
+
+{
+  "project_id": 1,
+  "cabinet_uuid": "uuid-1232-2226",
+  "name": "example cabinet updated",
+  "storage_type": "local",
+  "storage_base_path": "/data",
+  "storage_path": "uploads",
+  "vector_store": "faiss",
+  "collection_name": "collection_1",
+  "system_profile_id": 1,
+  "is_active": true
+}
+
+###
+
+DELETE http://127.0.0.1:8000/api/model/system_profile
+Content-Type: application/json
+
+{
+  "id": 123
+}
+
+###
+
+PUT http://127.0.0.1:8000/api/model/system_profile
+Content-Type: application/json
+
+{
+  "id": 123,
+  "name": "example",
+  "description": "desc",
+  "llm_model_config_id": 1,
+  "embedding_model_config_id": 2,
+  "is_active": 1
+}

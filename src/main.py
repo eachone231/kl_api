@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.config import settings
 from src.resources.mysql import close_mysql
+from src.resources.redis import close_redis, get_redis_client
 from src.routers import api_router
 
 
@@ -12,9 +13,14 @@ from src.routers import api_router
 async def lifespan(_: FastAPI):
     # Startup/shutdown hooks live here.
     try:
+        try:
+            await get_redis_client()
+        except RuntimeError:
+            pass
         yield
     finally:
         await close_mysql()
+        await close_redis()
 
 
 app = FastAPI(lifespan=lifespan, title=settings.app_name)

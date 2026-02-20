@@ -88,6 +88,54 @@ class ModelsSummaryResponse(BaseModel):
     llm_model_configs_count: int
     embedding_model_configs_count: int
     embedding_runs_count: int
+    system_profile_count: int
+
+
+class SystemProfileItem(BaseModel):
+    id: int
+    name: str | None = None
+    description: str | None = None
+    llm_model_config_id: int | None = None
+    embedding_model_config_id: int | None = None
+    is_active: bool | None = None
+    created_at: datetime | None = None
+    llm_config: dict[str, object] | None = None
+    embedding_config: dict[str, object] | None = None
+    llm_model: dict[str, object] | None = None
+    embedding_model: dict[str, object] | None = None
+
+
+class SystemProfilesResponse(BaseModel):
+    items: list[SystemProfileItem]
+
+
+class SystemProfileCreateRequest(BaseModel):
+    name: str
+    description: str
+    llm_model_config_id: int
+    embedding_model_config_id: int
+    is_active: int
+
+
+class SystemProfileResponse(BaseModel):
+    item: SystemProfileItem
+
+
+class SystemProfileDeleteRequest(BaseModel):
+    id: int
+
+
+class SystemProfileDeleteResponse(BaseModel):
+    deleted: bool
+
+
+class SystemProfileUpdateRequest(BaseModel):
+    id: int
+    name: str
+    description: str
+    llm_model_config_id: int
+    embedding_model_config_id: int
+    is_active: int
 
 
 class ModelUpdateRequest(BaseModel):
@@ -224,8 +272,7 @@ class Cabinet(BaseModel):
     storage_path: str | None = None
     vector_store: str | None = None
     collection_name: str | None = None
-    embedding_model_name: str | None = None
-    embedding_dim: int | None = None
+    system_profile: SystemProfileItem | None = None
     is_active: bool | None = None
 
 
@@ -237,6 +284,14 @@ class CabinetResponse(BaseModel):
     item: Cabinet
 
 
+class CabinetDeleteRequest(BaseModel):
+    cabinet_uuid: str
+
+
+class CabinetDeleteResponse(BaseModel):
+    deleted: bool
+
+
 class CabinetUpdateRequest(BaseModel):
     project_id: int
     cabinet_uuid: str
@@ -246,8 +301,7 @@ class CabinetUpdateRequest(BaseModel):
     storage_path: str
     vector_store: str
     collection_name: str
-    embedding_model_name: str
-    embedding_dim: int
+    system_profile_id: int
     is_active: bool
 
 
@@ -259,8 +313,7 @@ class CabinetCreateRequest(BaseModel):
     storage_path: str
     vector_store: str
     collection_name: str
-    embedding_model_id: int
-    embedding_dim: int
+    system_profile_id: int
 
 
 class LoginRequest(BaseModel):
@@ -278,6 +331,45 @@ class LoginResponse(BaseModel):
     code: int
     data: LoginData | None = None
     message: str | None = None
+
+
+class UserItem(BaseModel):
+    id: int | None = None
+    emp_id: str | None = None
+    username: str | None = None
+    email: str | None = None
+    is_active: bool | None = None
+    created_at: datetime | None = None
+
+
+class UserCreateRequest(BaseModel):
+    emp_id: str
+    username: str
+    email: str
+    password: str
+
+
+class UserResponse(BaseModel):
+    item: UserItem
+
+
+class UserResetRequest(BaseModel):
+    emp_id: str
+    email: str
+
+
+class UserResetResponse(BaseModel):
+    token: str
+    expires_at: datetime
+
+
+class UserResetConfirmRequest(BaseModel):
+    token: str
+    password: str
+
+
+class UserResetConfirmResponse(BaseModel):
+    reset: bool
 
 
 class PageInfo(BaseModel):
@@ -461,3 +553,44 @@ class DocumentQASummaryItem(BaseModel):
 class CabinetDocumentSummaryResponse(BaseModel):
     summary: dict[str, int]
     documents: list[DocumentQASummaryItem]
+
+
+class EnquerySummaryResponse(BaseModel):
+    total: int
+    waiting: int
+    approve: int
+    edit: int
+    reject: int
+    avg_score: float | None = None
+
+
+class EnqueryCitedChunk(BaseModel):
+    chunk_id: int
+    doc_uuid: str
+    chunk_index: int | None = None
+    content: str | None = None
+    file_name: str | None = None
+    file_type: str | None = None
+    file_size: int | None = None
+
+
+class EnqueryItem(BaseModel):
+    id: int
+    task_id: str
+    channel: str
+    question: str
+    ai_answer: str | None = None
+    human_answer: str | None = None
+    final_answer: str | None = None
+    action: str | None = None
+    human: str | None = None
+    score: int | None = None
+    reason: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    cited_chunks: list[EnqueryCitedChunk]
+
+
+class EnqueryListResponse(BaseModel):
+    items: list[EnqueryItem]
+    page_info: PageInfo

@@ -65,7 +65,8 @@ async def fetch_models_summary_async(db) -> dict[str, int]:
         (SELECT COUNT(*) FROM models) AS models_count,
         (SELECT COUNT(*) FROM llm_model_configs) AS llm_model_configs_count,
         (SELECT COUNT(*) FROM embedding_model_configs) AS embedding_model_configs_count,
-        (SELECT COUNT(*) FROM embedding_runs) AS embedding_runs_count
+        (SELECT COUNT(*) FROM embedding_runs) AS embedding_runs_count,
+        (SELECT COUNT(*) FROM system_profiles) AS system_profile_count
     """
     async with db.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute(counts_qry)
@@ -78,7 +79,352 @@ async def fetch_models_summary_async(db) -> dict[str, int]:
             row.get("embedding_model_configs_count") or 0
         ),
         "embedding_runs_count": int(row.get("embedding_runs_count") or 0),
+        "system_profile_count": int(row.get("system_profile_count") or 0),
     }
+
+
+def _extract_prefixed_row(
+    row: dict[str, object], prefix: str
+) -> dict[str, object]:
+    return {
+        key[len(prefix) :]: value
+        for key, value in row.items()
+        if key.startswith(prefix)
+    }
+
+
+def _clean_optional_row(data: dict[str, object]) -> dict[str, object] | None:
+    if not data:
+        return None
+    if data.get("id") is None and all(value is None for value in data.values()):
+        return None
+    return data
+
+
+def _build_system_profile_from_row(
+    row: dict[str, object],
+) -> "SystemProfileItem | None":
+    from src.model.kl_models import SystemProfileItem
+
+    sp_data = _extract_prefixed_row(row, "sp_")
+    if not sp_data or sp_data.get("id") is None:
+        return None
+    llm_config = _clean_optional_row(_extract_prefixed_row(row, "llmc_"))
+    embedding_config = _clean_optional_row(_extract_prefixed_row(row, "emc_"))
+    llm_model = _clean_optional_row(_extract_prefixed_row(row, "llmm_"))
+    embedding_model = _clean_optional_row(_extract_prefixed_row(row, "emmm_"))
+
+    return SystemProfileItem(
+        id=sp_data.get("id"),
+        name=sp_data.get("name"),
+        description=sp_data.get("description"),
+        llm_model_config_id=sp_data.get("llm_model_config_id"),
+        embedding_model_config_id=sp_data.get("embedding_model_config_id"),
+        is_active=(
+            bool(sp_data.get("is_active"))
+            if sp_data.get("is_active") is not None
+            else None
+        ),
+        created_at=sp_data.get("created_at"),
+        llm_config=llm_config,
+        embedding_config=embedding_config,
+        llm_model=llm_model,
+        embedding_model=embedding_model,
+    )
+
+
+async def fetch_system_profiles_async(
+    db,
+    is_active: bool | None = None,
+    system_profile_id: int | None = None,
+) -> list["SystemProfileItem"]:
+    import aiomysql
+
+    sp_columns = await _get_table_columns_async(db, "system_profiles")
+    llm_config_columns = await _get_table_columns_async(db, "llm_model_configs")
+    embedding_config_columns = await _get_table_columns_async(
+        db, "embedding_model_configs"
+    )
+    model_columns = await _get_table_columns_async(db, "models")
+
+    sp_select = [f"sp.{col} AS sp_{col}" for col in sp_columns]
+    llm_config_select = [
+        f"llmc.{col} AS llmc_{col}" for col in llm_config_columns
+    ]
+    embedding_config_select = [
+        f"emc.{col} AS emc_{col}" for col in embedding_config_columns
+    ]
+    llm_model_select = [f"llmm.{col} AS llmm_{col}" for col in model_columns]
+    embedding_model_select = [
+        f"emmm.{col} AS emmm_{col}" for col in model_columns
+    ]
+    select_sql = ", ".join(
+        sp_select
+        + llm_config_select
+        + embedding_config_select
+        + llm_model_select
+        + embedding_model_select
+    )
+
+    where_clauses: list[str] = []
+    params: dict[str, object] = {}
+    if system_profile_id is not None:
+        where_clauses.append("sp.id = %(system_profile_id)s")
+        params["system_profile_id"] = int(system_profile_id)
+    if is_active is not None and "is_active" in sp_columns:
+        where_clauses.append("sp.is_active = %(is_active)s")
+        params["is_active"] = int(is_active)
+    where_sql = (
+        f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    )
+
+    qry = f"""
+    SELECT {select_sql}
+    FROM system_profiles
+    AS sp
+    LEFT JOIN llm_model_configs llmc ON llmc.id = sp.llm_model_config_id
+    LEFT JOIN embedding_model_configs emc ON emc.id = sp.embedding_model_config_id
+    LEFT JOIN models llmm ON llmm.id = llmc.model_id
+    LEFT JOIN models emmm ON emmm.id = emc.model_id
+    {where_sql}
+    ORDER BY sp.id
+    """
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(qry, params)
+        rows = await cursor.fetchall()
+
+    return [
+        item
+        for row in rows
+        if (item := _build_system_profile_from_row(row)) is not None
+    ]
+
+
+async def create_system_profile_async(
+    db,
+    payload: "SystemProfileCreateRequest",
+) -> "SystemProfileItem":
+    import aiomysql
+
+    from src.model.kl_models import SystemProfileCreateRequest
+
+    if not isinstance(payload, SystemProfileCreateRequest):
+        raise TypeError("payload must be SystemProfileCreateRequest")
+
+    columns = await _get_table_columns_async(db, "system_profiles")
+    insert_fields = []
+    params: dict[str, object] = {}
+    values = {
+        "name": payload.name,
+        "description": payload.description,
+        "llm_model_config_id": payload.llm_model_config_id,
+        "embedding_model_config_id": payload.embedding_model_config_id,
+        "is_active": int(payload.is_active),
+    }
+    for key, value in values.items():
+        if key in columns:
+            insert_fields.append(key)
+            params[key] = value
+    if "created_at" in columns:
+        insert_fields.append("created_at")
+        params["created_at"] = None
+    if "updated_at" in columns:
+        insert_fields.append("updated_at")
+        params["updated_at"] = None
+
+    if not insert_fields:
+        raise RuntimeError("system_profiles has no writable columns")
+
+    value_placeholders = []
+    for field in insert_fields:
+        value_placeholders.append(
+            "NOW()" if field in ("created_at", "updated_at") else f"%({field})s"
+        )
+
+    insert_qry = (
+        "INSERT INTO system_profiles ("
+        + ", ".join(insert_fields)
+        + ") VALUES ("
+        + ", ".join(value_placeholders)
+        + ")"
+    )
+
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(insert_qry, params)
+        system_profile_id = cursor.lastrowid
+
+    items = await fetch_system_profiles_async(
+        db, system_profile_id=system_profile_id
+    )
+    if not items:
+        raise RuntimeError("Failed to load created system profile")
+    return items[0]
+
+
+async def delete_system_profile_async(
+    db,
+    system_profile_id: int,
+) -> bool:
+    import aiomysql
+
+    delete_qry = """
+    DELETE FROM system_profiles
+    WHERE id = %(id)s
+    """
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(delete_qry, {"id": system_profile_id})
+        return cursor.rowcount > 0
+
+
+async def update_system_profile_async(
+    db,
+    payload: "SystemProfileUpdateRequest",
+) -> tuple[bool, "SystemProfileItem | None"]:
+    import aiomysql
+
+    from src.model.kl_models import SystemProfileUpdateRequest
+
+    if not isinstance(payload, SystemProfileUpdateRequest):
+        raise TypeError("payload must be SystemProfileUpdateRequest")
+
+    columns = await _get_table_columns_async(db, "system_profiles")
+    exists_qry = "SELECT id FROM system_profiles WHERE id = %(id)s LIMIT 1"
+    update_fields = []
+    params: dict[str, object] = {"id": payload.id}
+    values = {
+        "name": payload.name,
+        "description": payload.description,
+        "llm_model_config_id": payload.llm_model_config_id,
+        "embedding_model_config_id": payload.embedding_model_config_id,
+        "is_active": int(payload.is_active),
+    }
+    for key, value in values.items():
+        if key in columns:
+            update_fields.append(f"{key} = %({key})s")
+            params[key] = value
+    if "updated_at" in columns:
+        update_fields.append("updated_at = NOW()")
+
+    if not update_fields:
+        raise RuntimeError("system_profiles has no writable columns")
+
+    update_qry = (
+        "UPDATE system_profiles SET "
+        + ", ".join(update_fields)
+        + " WHERE id = %(id)s"
+    )
+
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(exists_qry, {"id": payload.id})
+        exists = await cursor.fetchone()
+        if exists is None:
+            return False, None
+        await cursor.execute(update_qry, params)
+
+    items = await fetch_system_profiles_async(
+        db, system_profile_id=payload.id
+    )
+    if not items:
+        return True, None
+    return True, items[0]
+
+
+async def deactivate_system_profile_async(
+    db,
+    system_profile_id: int,
+) -> tuple[bool, "SystemProfileItem | None", list[dict[str, object]] | None, str | None]:
+    import aiomysql
+
+    sp_columns = await _get_table_columns_async(db, "system_profiles")
+    if "is_active" not in sp_columns:
+        raise RuntimeError("system_profiles table missing is_active")
+
+    cabinet_columns = await _get_cabinets_columns_async(db)
+    if "system_profile_id" not in cabinet_columns:
+        raise RuntimeError("cabinets table missing system_profile_id")
+    if "is_active" not in cabinet_columns:
+        raise RuntimeError("cabinets table missing is_active")
+
+    exists_qry = "SELECT id FROM system_profiles WHERE id = %(id)s LIMIT 1"
+    cabinets_qry = """
+    SELECT
+        id,
+        project_id,
+        cabinet_uuid,
+        cabinet_name
+    FROM cabinets
+    WHERE system_profile_id = %(id)s
+      AND is_active = 1
+    ORDER BY project_id, cabinet_name, cabinet_uuid
+    """
+    update_qry = """
+    UPDATE system_profiles
+    SET is_active = 0
+    WHERE id = %(id)s
+    """
+
+    params = {"id": system_profile_id}
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(exists_qry, params)
+        exists = await cursor.fetchone()
+        if exists is None:
+            return False, None, None, "not_found"
+
+        await cursor.execute(cabinets_qry, params)
+        cabinets = await cursor.fetchall() or []
+        if cabinets:
+            cabinet_items = [
+                {
+                    "id": row["id"],
+                    "project_id": row["project_id"],
+                    "cabinet_uuid": row["cabinet_uuid"],
+                    "name": row["cabinet_name"],
+                }
+                for row in cabinets
+            ]
+            return True, None, cabinet_items, "has_active_cabinets"
+
+        await cursor.execute(update_qry, params)
+
+    items = await fetch_system_profiles_async(
+        db, system_profile_id=system_profile_id
+    )
+    if not items:
+        return True, None, None, "update_failed"
+    return True, items[0], None, None
+
+
+async def activate_system_profile_async(
+    db,
+    system_profile_id: int,
+) -> tuple[bool, "SystemProfileItem | None", str | None]:
+    import aiomysql
+
+    sp_columns = await _get_table_columns_async(db, "system_profiles")
+    if "is_active" not in sp_columns:
+        raise RuntimeError("system_profiles table missing is_active")
+
+    exists_qry = "SELECT id FROM system_profiles WHERE id = %(id)s LIMIT 1"
+    update_qry = """
+    UPDATE system_profiles
+    SET is_active = 1
+    WHERE id = %(id)s
+    """
+    params = {"id": system_profile_id}
+
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(exists_qry, params)
+        exists = await cursor.fetchone()
+        if exists is None:
+            return False, None, "not_found"
+        await cursor.execute(update_qry, params)
+
+    items = await fetch_system_profiles_async(
+        db, system_profile_id=system_profile_id
+    )
+    if not items:
+        return True, None, "update_failed"
+    return True, items[0], None
 
 
 async def update_model_deprecated_async(
@@ -147,14 +493,17 @@ async def fetch_model_configs_async(
     ) -> list[dict[str, object]]:
         columns = await _get_table_columns_async(db, table)
         order_sql = " ORDER BY id DESC" if "id" in columns else ""
-        where_sql = ""
+        where_clauses: list[str] = []
         params: dict[str, object] = {}
         if model_id_value is not None:
             model_id_col = _pick_first_column(columns, ("model_id",))
             if not model_id_col:
                 raise RuntimeError(f"{table} missing model_id column")
-            where_sql = f" WHERE {model_id_col} = %(model_id)s"
+            where_clauses.append(f"{model_id_col} = %(model_id)s")
             params["model_id"] = model_id_value
+        where_sql = (
+            f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        )
         select_qry = f"SELECT * FROM {table}{where_sql}{order_sql}"
         async with db.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute(select_qry, params)
@@ -1113,38 +1462,70 @@ async def fetch_projects_summary_async(
     return summary, items
 
 
+async def _build_cabinet_select_sql(db, table_alias: str = "c") -> str:
+    storage_cols = await _resolve_cabinet_storage_columns_async(db)
+    storage_type_col = storage_cols["storage_type"]
+    base_path_col = storage_cols["storage_base_path"]
+    upload_path_col = storage_cols["storage_path"]
+
+    sp_columns = await _get_table_columns_async(db, "system_profiles")
+    llm_config_columns = await _get_table_columns_async(db, "llm_model_configs")
+    embedding_config_columns = await _get_table_columns_async(
+        db, "embedding_model_configs"
+    )
+    model_columns = await _get_table_columns_async(db, "models")
+
+    cabinet_select = [
+        f"{table_alias}.id",
+        f"{table_alias}.project_id",
+        f"{table_alias}.cabinet_uuid",
+        f"{table_alias}.cabinet_name",
+        f"{table_alias}.{storage_type_col} AS storage_type",
+        f"{table_alias}.{base_path_col} AS storage_base_path",
+        f"{table_alias}.{upload_path_col} AS storage_path",
+        f"{table_alias}.vector_store",
+        f"{table_alias}.collection_name",
+        f"{table_alias}.is_active",
+    ]
+    sp_select = [f"sp.{col} AS sp_{col}" for col in sp_columns]
+    llm_config_select = [
+        f"llmc.{col} AS llmc_{col}" for col in llm_config_columns
+    ]
+    embedding_config_select = [
+        f"emc.{col} AS emc_{col}" for col in embedding_config_columns
+    ]
+    llm_model_select = [f"llmm.{col} AS llmm_{col}" for col in model_columns]
+    embedding_model_select = [
+        f"emmm.{col} AS emmm_{col}" for col in model_columns
+    ]
+    return ", ".join(
+        cabinet_select
+        + sp_select
+        + llm_config_select
+        + embedding_config_select
+        + llm_model_select
+        + embedding_model_select
+    )
+
+
 async def fetch_cabinets_by_project_async(db, project_id: int) -> list["Cabinet"]:
     import aiomysql
 
     from src.model.kl_models import Cabinet
 
-    storage_cols = await _resolve_cabinet_storage_columns_async(db)
-    storage_type_col = storage_cols["storage_type"]
-    base_path_col = storage_cols["storage_base_path"]
-    upload_path_col = storage_cols["storage_path"]
-    qry = """
-    SELECT
-        id,
-        project_id,
-        cabinet_uuid,
-        cabinet_name,
-        {storage_type_col} AS storage_type,
-        {base_path_col} AS storage_base_path,
-        {upload_path_col} AS storage_path,
-        vector_store,
-        collection_name,
-        embedding_model_name,
-        embedding_dim,
-        is_active
-    FROM cabinets
-    WHERE project_id = %(project_id)s
-    ORDER BY id
+    select_sql = await _build_cabinet_select_sql(db, table_alias="c")
+    qry = f"""
+    SELECT {select_sql}
+    FROM cabinets c
+    LEFT JOIN system_profiles sp ON sp.id = c.system_profile_id
+    LEFT JOIN llm_model_configs llmc ON llmc.id = sp.llm_model_config_id
+    LEFT JOIN embedding_model_configs emc ON emc.id = sp.embedding_model_config_id
+    LEFT JOIN models llmm ON llmm.id = llmc.model_id
+    LEFT JOIN models emmm ON emmm.id = emc.model_id
+    WHERE c.project_id = %(project_id)s
+    ORDER BY c.id
     LIMIT 0 , 1000
-    """.format(
-        storage_type_col=storage_type_col,
-        base_path_col=base_path_col,
-        upload_path_col=upload_path_col,
-    )
+    """
     async with db.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute(qry, {"project_id": project_id})
         rows = await cursor.fetchall()
@@ -1159,8 +1540,7 @@ async def fetch_cabinets_by_project_async(db, project_id: int) -> list["Cabinet"
             storage_path=row["storage_path"],
             vector_store=row["vector_store"],
             collection_name=row["collection_name"],
-            embedding_model_name=row["embedding_model_name"],
-            embedding_dim=row["embedding_dim"],
+            system_profile=_build_system_profile_from_row(row),
             is_active=bool(row["is_active"]) if row["is_active"] is not None else None,
         )
         for row in rows
@@ -1176,33 +1556,19 @@ async def fetch_cabinet_by_project_uuid_async(
 
     from src.model.kl_models import Cabinet
 
-    storage_cols = await _resolve_cabinet_storage_columns_async(db)
-    storage_type_col = storage_cols["storage_type"]
-    base_path_col = storage_cols["storage_base_path"]
-    upload_path_col = storage_cols["storage_path"]
-    qry = """
-    SELECT
-        id,
-        project_id,
-        cabinet_uuid,
-        cabinet_name,
-        {storage_type_col} AS storage_type,
-        {base_path_col} AS storage_base_path,
-        {upload_path_col} AS storage_path,
-        vector_store,
-        collection_name,
-        embedding_model_name,
-        embedding_dim,
-        is_active
-    FROM cabinets
-    WHERE project_id = %(project_id)s
-        AND cabinet_uuid = %(cabinet_uuid)s
+    select_sql = await _build_cabinet_select_sql(db, table_alias="c")
+    qry = f"""
+    SELECT {select_sql}
+    FROM cabinets c
+    LEFT JOIN system_profiles sp ON sp.id = c.system_profile_id
+    LEFT JOIN llm_model_configs llmc ON llmc.id = sp.llm_model_config_id
+    LEFT JOIN embedding_model_configs emc ON emc.id = sp.embedding_model_config_id
+    LEFT JOIN models llmm ON llmm.id = llmc.model_id
+    LEFT JOIN models emmm ON emmm.id = emc.model_id
+    WHERE c.project_id = %(project_id)s
+        AND c.cabinet_uuid = %(cabinet_uuid)s
     LIMIT 1
-    """.format(
-        storage_type_col=storage_type_col,
-        base_path_col=base_path_col,
-        upload_path_col=upload_path_col,
-    )
+    """
     async with db.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute(
             qry,
@@ -1221,8 +1587,7 @@ async def fetch_cabinet_by_project_uuid_async(
         storage_path=row["storage_path"],
         vector_store=row["vector_store"],
         collection_name=row["collection_name"],
-        embedding_model_name=row["embedding_model_name"],
-        embedding_dim=row["embedding_dim"],
+        system_profile=_build_system_profile_from_row(row),
         is_active=bool(row["is_active"]) if row["is_active"] is not None else None,
     )
 
@@ -1235,32 +1600,18 @@ async def fetch_cabinet_by_uuid_async(
 
     from src.model.kl_models import Cabinet
 
-    storage_cols = await _resolve_cabinet_storage_columns_async(db)
-    storage_type_col = storage_cols["storage_type"]
-    base_path_col = storage_cols["storage_base_path"]
-    upload_path_col = storage_cols["storage_path"]
-    qry = """
-    SELECT
-        id,
-        project_id,
-        cabinet_uuid,
-        cabinet_name,
-        {storage_type_col} AS storage_type,
-        {base_path_col} AS storage_base_path,
-        {upload_path_col} AS storage_path,
-        vector_store,
-        collection_name,
-        embedding_model_name,
-        embedding_dim,
-        is_active
-    FROM cabinets
-    WHERE cabinet_uuid = %(cabinet_uuid)s
+    select_sql = await _build_cabinet_select_sql(db, table_alias="c")
+    qry = f"""
+    SELECT {select_sql}
+    FROM cabinets c
+    LEFT JOIN system_profiles sp ON sp.id = c.system_profile_id
+    LEFT JOIN llm_model_configs llmc ON llmc.id = sp.llm_model_config_id
+    LEFT JOIN embedding_model_configs emc ON emc.id = sp.embedding_model_config_id
+    LEFT JOIN models llmm ON llmm.id = llmc.model_id
+    LEFT JOIN models emmm ON emmm.id = emc.model_id
+    WHERE c.cabinet_uuid = %(cabinet_uuid)s
     LIMIT 1
-    """.format(
-        storage_type_col=storage_type_col,
-        base_path_col=base_path_col,
-        upload_path_col=upload_path_col,
-    )
+    """
     async with db.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute(qry, {"cabinet_uuid": cabinet_uuid})
         row = await cursor.fetchone()
@@ -1276,8 +1627,7 @@ async def fetch_cabinet_by_uuid_async(
         storage_path=row["storage_path"],
         vector_store=row["vector_store"],
         collection_name=row["collection_name"],
-        embedding_model_name=row["embedding_model_name"],
-        embedding_dim=row["embedding_dim"],
+        system_profile=_build_system_profile_from_row(row),
         is_active=bool(row["is_active"]) if row["is_active"] is not None else None,
     )
 
@@ -1285,7 +1635,7 @@ async def fetch_cabinet_by_uuid_async(
 async def update_cabinet_async(
     db,
     payload: "CabinetUpdateRequest",
-) -> tuple[bool, "Cabinet | None"]:
+) -> tuple[bool, "Cabinet | None", str | None]:
     import aiomysql
 
     from src.model.kl_models import Cabinet, CabinetUpdateRequest
@@ -1297,6 +1647,10 @@ async def update_cabinet_async(
     storage_type_col = storage_cols["storage_type"]
     base_path_col = storage_cols["storage_base_path"]
     upload_path_col = storage_cols["storage_path"]
+
+    columns = await _get_cabinets_columns_async(db)
+    if "system_profile_id" not in columns:
+        raise RuntimeError("cabinets table missing system_profile_id")
 
     cabinet_qry = """
     SELECT id
@@ -1314,29 +1668,22 @@ async def update_cabinet_async(
         {upload_path_col} = %(storage_path)s,
         vector_store = %(vector_store)s,
         collection_name = %(collection_name)s,
-        embedding_model_name = %(embedding_model_name)s,
-        embedding_dim = %(embedding_dim)s,
+        system_profile_id = %(system_profile_id)s,
         is_active = %(is_active)s
     WHERE project_id = %(project_id)s
       AND cabinet_uuid = %(cabinet_uuid)s
     """
+    select_sql = await _build_cabinet_select_sql(db, table_alias="c")
     select_qry = f"""
-    SELECT
-        id,
-        project_id,
-        cabinet_uuid,
-        cabinet_name,
-        {storage_type_col} AS storage_type,
-        {base_path_col} AS storage_base_path,
-        {upload_path_col} AS storage_path,
-        vector_store,
-        collection_name,
-        embedding_model_name,
-        embedding_dim,
-        is_active
-    FROM cabinets
-    WHERE project_id = %(project_id)s
-      AND cabinet_uuid = %(cabinet_uuid)s
+    SELECT {select_sql}
+    FROM cabinets c
+    LEFT JOIN system_profiles sp ON sp.id = c.system_profile_id
+    LEFT JOIN llm_model_configs llmc ON llmc.id = sp.llm_model_config_id
+    LEFT JOIN embedding_model_configs emc ON emc.id = sp.embedding_model_config_id
+    LEFT JOIN models llmm ON llmm.id = llmc.model_id
+    LEFT JOIN models emmm ON emmm.id = emc.model_id
+    WHERE c.project_id = %(project_id)s
+      AND c.cabinet_uuid = %(cabinet_uuid)s
     LIMIT 1
     """
     params = {
@@ -1348,8 +1695,7 @@ async def update_cabinet_async(
         "storage_path": payload.storage_path,
         "vector_store": payload.vector_store,
         "collection_name": payload.collection_name,
-        "embedding_model_name": payload.embedding_model_name,
-        "embedding_dim": payload.embedding_dim,
+        "system_profile_id": payload.system_profile_id,
         "is_active": int(payload.is_active),
     }
 
@@ -1357,13 +1703,20 @@ async def update_cabinet_async(
         await cursor.execute(cabinet_qry, params)
         cabinet_row = await cursor.fetchone()
         if cabinet_row is None:
-            return False, None
+            return False, None, "not_found"
+        await cursor.execute(
+            "SELECT id FROM system_profiles WHERE id = %(id)s LIMIT 1",
+            {"id": payload.system_profile_id},
+        )
+        sp_row = await cursor.fetchone()
+        if sp_row is None:
+            return False, None, "system_profile_missing"
         await cursor.execute(update_qry, params)
         await cursor.execute(select_qry, params)
         row = await cursor.fetchone()
 
     if row is None:
-        return True, None
+        return True, None, "update_failed"
     return True, Cabinet(
         id=row["id"],
         project_id=row["project_id"],
@@ -1374,10 +1727,141 @@ async def update_cabinet_async(
         storage_path=row["storage_path"],
         vector_store=row["vector_store"],
         collection_name=row["collection_name"],
-        embedding_model_name=row["embedding_model_name"],
-        embedding_dim=row["embedding_dim"],
+        system_profile=_build_system_profile_from_row(row),
         is_active=bool(row["is_active"]) if row["is_active"] is not None else None,
-    )
+    ), None
+
+
+async def activate_cabinet_async(
+    db,
+    cabinet_uuid: str,
+) -> tuple[
+    bool,
+    "Cabinet | None",
+    "SystemProfileItem | None",
+    str | None,
+]:
+    import aiomysql
+
+    cabinet_columns = await _get_cabinets_columns_async(db)
+    if "system_profile_id" not in cabinet_columns:
+        raise RuntimeError("cabinets table missing system_profile_id")
+    if "is_active" not in cabinet_columns:
+        raise RuntimeError("cabinets table missing is_active")
+
+    cabinet_qry = """
+    SELECT id, system_profile_id
+    FROM cabinets
+    WHERE cabinet_uuid = %(cabinet_uuid)s
+    LIMIT 1
+    """
+    update_qry = """
+    UPDATE cabinets
+    SET is_active = 1
+    WHERE cabinet_uuid = %(cabinet_uuid)s
+    """
+    params = {"cabinet_uuid": cabinet_uuid}
+
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(cabinet_qry, params)
+        cabinet_row = await cursor.fetchone()
+        if cabinet_row is None:
+            return False, None, None, "not_found"
+
+        system_profile_id = cabinet_row.get("system_profile_id")
+        if system_profile_id is None:
+            return True, None, None, "system_profile_missing"
+
+        system_profiles = await fetch_system_profiles_async(
+            db, system_profile_id=int(system_profile_id)
+        )
+        if not system_profiles:
+            return True, None, None, "system_profile_missing"
+
+        system_profile = system_profiles[0]
+        if not system_profile.is_active:
+            return True, None, system_profile, "system_profile_inactive"
+
+        await cursor.execute(update_qry, params)
+
+    cabinet = await fetch_cabinet_by_uuid_async(db, cabinet_uuid=cabinet_uuid)
+    if cabinet is None:
+        return True, None, None, "update_failed"
+    return True, cabinet, None, None
+
+
+async def deactivate_cabinet_async(
+    db,
+    cabinet_uuid: str,
+) -> tuple[bool, "Cabinet | None", str | None]:
+    import aiomysql
+
+    cabinet_columns = await _get_cabinets_columns_async(db)
+    if "is_active" not in cabinet_columns:
+        raise RuntimeError("cabinets table missing is_active")
+
+    cabinet_qry = """
+    SELECT id
+    FROM cabinets
+    WHERE cabinet_uuid = %(cabinet_uuid)s
+    LIMIT 1
+    """
+    update_qry = """
+    UPDATE cabinets
+    SET is_active = 0
+    WHERE cabinet_uuid = %(cabinet_uuid)s
+    """
+    params = {"cabinet_uuid": cabinet_uuid}
+
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(cabinet_qry, params)
+        cabinet_row = await cursor.fetchone()
+        if cabinet_row is None:
+            return False, None, "not_found"
+        await cursor.execute(update_qry, params)
+
+    cabinet = await fetch_cabinet_by_uuid_async(db, cabinet_uuid=cabinet_uuid)
+    if cabinet is None:
+        return True, None, "update_failed"
+    return True, cabinet, None
+
+
+async def delete_cabinet_async(
+    db,
+    cabinet_uuid: str,
+) -> tuple[bool, str | None]:
+    import aiomysql
+
+    exists_qry = """
+    SELECT id
+    FROM cabinets
+    WHERE cabinet_uuid = %(cabinet_uuid)s
+    LIMIT 1
+    """
+    documents_qry = """
+    SELECT COUNT(*) AS document_count
+    FROM documents
+    WHERE cabinet_uuid = %(cabinet_uuid)s
+    """
+    delete_qry = """
+    DELETE FROM cabinets
+    WHERE cabinet_uuid = %(cabinet_uuid)s
+    """
+    params = {"cabinet_uuid": cabinet_uuid}
+
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(exists_qry, params)
+        exists = await cursor.fetchone()
+        if exists is None:
+            return False, "not_found"
+
+        await cursor.execute(documents_qry, params)
+        documents_row = await cursor.fetchone() or {}
+        if int(documents_row.get("document_count") or 0) > 0:
+            return False, "has_documents"
+
+        await cursor.execute(delete_qry, params)
+    return True, None
 
 
 async def create_cabinet_async(
@@ -1399,26 +1883,15 @@ async def create_cabinet_async(
     base_path_col = storage_cols["storage_base_path"]
     upload_path_col = storage_cols["storage_path"]
 
-    embedding_column = None
-    embedding_value = None
-    if "embedding_model_id" in column_names:
-        embedding_column = "embedding_model_id"
-        embedding_value = payload.embedding_model_id
-    elif "embedding_model_name" in column_names:
-        async with db.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute(
-                "SELECT model_name FROM models WHERE id = %(id)s LIMIT 1",
-                {"id": payload.embedding_model_id},
-            )
-            row = await cursor.fetchone()
-        if row is None:
-            return False, None
-        embedding_column = "embedding_model_name"
-        embedding_value = row["model_name"]
-    else:
-        raise RuntimeError(
-            "cabinets table missing embedding_model_id or embedding_model_name"
-        )
+    if "system_profile_id" not in column_names:
+        raise RuntimeError("cabinets table missing system_profile_id")
+
+    exists_qry = "SELECT id FROM system_profiles WHERE id = %(id)s LIMIT 1"
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(exists_qry, {"id": payload.system_profile_id})
+        row = await cursor.fetchone()
+    if row is None:
+        return False, None
 
     insert_columns_sql = [
         "project_id",
@@ -1429,8 +1902,7 @@ async def create_cabinet_async(
         upload_path_col,
         "vector_store",
         "collection_name",
-        "embedding_dim",
-        embedding_column,
+        "system_profile_id",
     ]
     values_sql = ", ".join(
         [
@@ -1442,28 +1914,21 @@ async def create_cabinet_async(
             "%(storage_path)s",
             "%(vector_store)s",
             "%(collection_name)s",
-            "%(embedding_dim)s",
-            f"%({embedding_column})s",
+            "%(system_profile_id)s",
         ]
     )
     columns_sql = ", ".join(insert_columns_sql)
     insert_qry = f"INSERT INTO cabinets ({columns_sql}) VALUES ({values_sql})"
+    select_sql = await _build_cabinet_select_sql(db, table_alias="c")
     select_qry = f"""
-    SELECT
-        id,
-        project_id,
-        cabinet_uuid,
-        cabinet_name,
-        {storage_type_col} AS storage_type,
-        {base_path_col} AS storage_base_path,
-        {upload_path_col} AS storage_path,
-        vector_store,
-        collection_name,
-        embedding_model_name,
-        embedding_dim,
-        is_active
-    FROM cabinets
-    WHERE cabinet_uuid = %(cabinet_uuid)s
+    SELECT {select_sql}
+    FROM cabinets c
+    LEFT JOIN system_profiles sp ON sp.id = c.system_profile_id
+    LEFT JOIN llm_model_configs llmc ON llmc.id = sp.llm_model_config_id
+    LEFT JOIN embedding_model_configs emc ON emc.id = sp.embedding_model_config_id
+    LEFT JOIN models llmm ON llmm.id = llmc.model_id
+    LEFT JOIN models emmm ON emmm.id = emc.model_id
+    WHERE c.cabinet_uuid = %(cabinet_uuid)s
     LIMIT 1
     """
     cabinet_uuid = str(uuid4())
@@ -1473,11 +1938,10 @@ async def create_cabinet_async(
         "cabinet_name": payload.name,
         "vector_store": payload.vector_store,
         "collection_name": payload.collection_name,
-        "embedding_dim": payload.embedding_dim,
         "storage_type": payload.storage_type,
         "storage_base_path": payload.storage_base_path,
         "storage_path": payload.storage_path,
-        embedding_column: embedding_value,
+        "system_profile_id": payload.system_profile_id,
     }
 
     async with db.cursor(aiomysql.DictCursor) as cursor:
@@ -1497,8 +1961,7 @@ async def create_cabinet_async(
         storage_path=row["storage_path"],
         vector_store=row["vector_store"],
         collection_name=row["collection_name"],
-        embedding_model_name=row["embedding_model_name"],
-        embedding_dim=row["embedding_dim"],
+        system_profile=_build_system_profile_from_row(row),
         is_active=bool(row["is_active"]) if row["is_active"] is not None else None,
     )
 
@@ -1515,24 +1978,375 @@ def verify_password(password: str, password_hash: str) -> bool:
     return argon2.verify(password, password_hash)
 
 
-async def authenticate_user_async(db, email: str, password: str) -> dict | None:
+async def authenticate_user_async(
+    db, email: str, password: str
+) -> tuple[dict | None, str | None]:
     import aiomysql
 
     qry = """
-    SELECT id, emp_id, username, email, password_hash
+    SELECT id, emp_id, username, email, password_hash, is_active
     FROM users
-    WHERE email = %(email)s AND is_active = 1
+    WHERE email = %(email)s
     LIMIT 1
     """
     async with db.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute(qry, {"email": email})
         row = await cursor.fetchone()
     if row is None:
-        return None
+        return None, "not_found"
     password_hash = row.get("password_hash")
     if not password_hash or not verify_password(password, password_hash):
-        return None
-    return row
+        return None, "invalid_password"
+    if not row.get("is_active"):
+        return None, "inactive"
+    return row, None
+
+
+async def create_user_async(
+    db,
+    payload: "UserCreateRequest",
+) -> tuple[bool, "UserItem | None", str | None]:
+    import aiomysql
+
+    from src.model.kl_models import UserCreateRequest, UserItem
+
+    if not isinstance(payload, UserCreateRequest):
+        raise TypeError("payload must be UserCreateRequest")
+
+    columns = await _get_table_columns_async(db, "users")
+    check_fields: list[str] = []
+    if "emp_id" in columns:
+        check_fields.append("emp_id")
+    if "email" in columns:
+        check_fields.append("email")
+
+    if check_fields:
+        where_sql = " OR ".join(
+            [f"{field} = %({field})s" for field in check_fields]
+        )
+        check_qry = f"""
+        SELECT {", ".join(check_fields)}
+        FROM users
+        WHERE {where_sql}
+        LIMIT 1
+        """
+        params = {
+            "emp_id": payload.emp_id,
+            "email": payload.email,
+        }
+        async with db.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(check_qry, params)
+            row = await cursor.fetchone()
+        if row is not None:
+            matches: list[str] = []
+            if "emp_id" in row and row.get("emp_id") == payload.emp_id:
+                matches.append("emp_id")
+            if "email" in row and row.get("email") == payload.email:
+                matches.append("email")
+            if matches:
+                return False, None, ",".join(matches)
+            return False, None, "user_exists"
+    insert_fields: list[str] = []
+    params: dict[str, object] = {}
+    values = {
+        "emp_id": payload.emp_id,
+        "username": payload.username,
+        "email": payload.email,
+        "password_hash": hash_password(payload.password),
+    }
+    for key, value in values.items():
+        if key in columns:
+            insert_fields.append(key)
+            params[key] = value
+    if not insert_fields:
+        raise RuntimeError("users has no writable columns")
+
+    insert_columns_sql = ", ".join(insert_fields)
+    insert_values_sql = ", ".join([f"%({key})s" for key in insert_fields])
+
+    select_fields = [
+        col
+        for col in [
+            "id",
+            "emp_id",
+            "username",
+            "email",
+            "is_active",
+            "created_at",
+        ]
+        if col in columns
+    ]
+    if not select_fields:
+        raise RuntimeError("users has no readable columns")
+    select_sql = ", ".join(select_fields)
+
+    insert_qry = f"""
+    INSERT INTO users ({insert_columns_sql})
+    VALUES ({insert_values_sql})
+    """
+    select_qry = f"""
+    SELECT {select_sql}
+    FROM users
+    WHERE id = %(id)s
+    LIMIT 1
+    """
+
+    try:
+        async with db.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(insert_qry, params)
+            user_id = cursor.lastrowid
+            await cursor.execute(select_qry, {"id": user_id})
+            row = await cursor.fetchone()
+    except aiomysql.IntegrityError as exc:
+        check_fields = []
+        if "emp_id" in columns:
+            check_fields.append("emp_id")
+        if "email" in columns:
+            check_fields.append("email")
+        if check_fields:
+            where_sql = " OR ".join(
+                [f"{field} = %({field})s" for field in check_fields]
+            )
+            check_qry = f"""
+            SELECT {", ".join(check_fields)}
+            FROM users
+            WHERE {where_sql}
+            LIMIT 1
+            """
+            params = {
+                "emp_id": payload.emp_id,
+                "email": payload.email,
+            }
+            async with db.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(check_qry, params)
+                row = await cursor.fetchone()
+            if row is not None:
+                matches: list[str] = []
+                if "emp_id" in row and row.get("emp_id") == payload.emp_id:
+                    matches.append("emp_id")
+                if "email" in row and row.get("email") == payload.email:
+                    matches.append("email")
+                if matches:
+                    return False, None, ",".join(matches)
+        return False, None, str(exc) or "integrity_error"
+    except Exception as exc:  # pragma: no cover - safety net
+        return False, None, str(exc)
+
+    if row is None:
+        return False, None, "Failed to load created user"
+    return True, UserItem(
+        id=row.get("id"),
+        emp_id=row.get("emp_id"),
+        username=row.get("username"),
+        email=row.get("email"),
+        is_active=(
+            bool(row.get("is_active"))
+            if row.get("is_active") is not None
+            else None
+        ),
+        created_at=row.get("created_at"),
+    ), None
+
+
+async def create_user_reset_token_async(
+    db,
+    payload: "UserResetRequest",
+    ip_address: str | None = None,
+) -> tuple[bool, dict[str, object] | None, str | None]:
+    import aiomysql
+    from datetime import datetime, timedelta
+    from email.message import EmailMessage
+    from secrets import token_urlsafe
+    from smtplib import SMTP
+    from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+
+    from src.config.settings import settings
+    from src.model.kl_models import UserResetRequest
+
+    if not isinstance(payload, UserResetRequest):
+        raise TypeError("payload must be UserResetRequest")
+
+    users_columns = await _get_table_columns_async(db, "users")
+    reset_columns = await _get_table_columns_async(db, "user_reset_tokens")
+
+    if "emp_id" not in users_columns or "email" not in users_columns:
+        raise RuntimeError("users table missing emp_id or email")
+
+    user_qry = """
+    SELECT emp_id, email
+    FROM users
+    WHERE emp_id = %(emp_id)s
+    LIMIT 1
+    """
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(user_qry, {"emp_id": payload.emp_id})
+        user_row = await cursor.fetchone()
+    if user_row is None or user_row.get("email") != payload.email:
+        return False, None, "user_not_found"
+
+    token = token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(minutes=10)
+
+    insert_fields: list[str] = []
+    params: dict[str, object] = {}
+    values = {
+        "emp_id": payload.emp_id,
+        "email": payload.email,
+        "token": token,
+        "expires_at": expires_at,
+        "used": 0,
+        "ip_address": ip_address,
+    }
+    for key, value in values.items():
+        if key in reset_columns and value is not None:
+            insert_fields.append(key)
+            params[key] = value
+
+    if not insert_fields:
+        raise RuntimeError("user_reset_tokens has no writable columns")
+
+    insert_columns_sql = ", ".join(insert_fields)
+    insert_values_sql = ", ".join([f"%({key})s" for key in insert_fields])
+
+    insert_qry = f"""
+    INSERT INTO user_reset_tokens ({insert_columns_sql})
+    VALUES ({insert_values_sql})
+    """
+
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(insert_qry, params)
+
+    if not settings.reset_base_url:
+        return False, None, "reset_base_url is not set"
+    if not settings.smtp_user or not settings.smtp_pass:
+        return False, None, "smtp credentials are not set"
+    smtp_from = settings.smtp_from or settings.smtp_user
+
+    parsed = urlparse(settings.reset_base_url)
+    query = dict(parse_qsl(parsed.query))
+    query["token"] = token
+    reset_link = urlunparse(
+        parsed._replace(query=urlencode(query, doseq=True))
+    )
+
+    message = EmailMessage()
+    message["Subject"] = "Password reset"
+    message["From"] = smtp_from
+    message["To"] = payload.email
+    message.set_content(
+        "\n".join(
+            [
+                "비밀번호 초기화 요청을 받았습니다.",
+                f"아래 링크에서 비밀번호를 재설정하세요 (10분 유효):",
+                reset_link,
+            ]
+        )
+    )
+
+    try:
+        with SMTP(settings.smtp_host, settings.smtp_port) as smtp:
+            if settings.smtp_use_tls:
+                smtp.starttls()
+            smtp.login(settings.smtp_user, settings.smtp_pass)
+            smtp.send_message(message)
+    except Exception as exc:  # pragma: no cover - depends on SMTP
+        return False, None, str(exc)
+
+    return True, {"token": token, "expires_at": expires_at}, None
+
+
+async def confirm_user_reset_token_async(
+    db,
+    payload: "UserResetConfirmRequest",
+) -> tuple[bool, str | None]:
+    import aiomysql
+    from datetime import datetime
+
+    from src.model.kl_models import UserResetConfirmRequest
+
+    if not isinstance(payload, UserResetConfirmRequest):
+        raise TypeError("payload must be UserResetConfirmRequest")
+
+    reset_columns = await _get_table_columns_async(db, "user_reset_tokens")
+    users_columns = await _get_table_columns_async(db, "users")
+
+    if "token" not in reset_columns:
+        raise RuntimeError("user_reset_tokens missing token column")
+    if "password_hash" not in users_columns:
+        raise RuntimeError("users missing password_hash column")
+
+    select_fields = ["token"]
+    for name in ("emp_id", "email", "expires_at", "used"):
+        if name in reset_columns:
+            select_fields.append(name)
+
+    select_qry = f"""
+    SELECT {", ".join(select_fields)}
+    FROM user_reset_tokens
+    WHERE token = %(token)s
+    LIMIT 1
+    """
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(select_qry, {"token": payload.token})
+        token_row = await cursor.fetchone()
+
+    if token_row is None:
+        return False, "invalid_token"
+
+    expires_at = token_row.get("expires_at")
+    if expires_at is not None and expires_at < datetime.utcnow():
+        return False, "token_expired"
+
+    used_value = token_row.get("used")
+    if used_value is not None and int(used_value) != 0:
+        return False, "token_used"
+
+    criteria: list[str] = []
+    params: dict[str, object] = {
+        "password_hash": hash_password(payload.password),
+    }
+    if "emp_id" in users_columns and token_row.get("emp_id") is not None:
+        criteria.append("emp_id = %(emp_id)s")
+        params["emp_id"] = token_row.get("emp_id")
+    if "email" in users_columns and token_row.get("email") is not None:
+        criteria.append("email = %(email)s")
+        params["email"] = token_row.get("email")
+
+    if not criteria:
+        return False, "token_missing_user"
+
+    update_user_qry = f"""
+    UPDATE users
+    SET password_hash = %(password_hash)s
+    WHERE {" AND ".join(criteria)}
+    """
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(update_user_qry, params)
+        if cursor.rowcount == 0:
+            return False, "user_not_found"
+
+    update_fields: list[str] = []
+    update_params: dict[str, object] = {"token": payload.token}
+    now = datetime.utcnow()
+    if "used" in reset_columns:
+        update_fields.append("used = 1")
+    if "used_at" in reset_columns:
+        update_fields.append("used_at = %(now)s")
+        update_params["now"] = now
+    if "updated_at" in reset_columns:
+        update_fields.append("updated_at = %(now)s")
+        update_params["now"] = now
+
+    if update_fields:
+        update_reset_qry = f"""
+        UPDATE user_reset_tokens
+        SET {", ".join(update_fields)}
+        WHERE token = %(token)s
+        """
+        async with db.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(update_reset_qry, update_params)
+
+    return True, None
 
 
 def _normalize_documents_sort(sort: str | None) -> str:
@@ -1727,6 +2541,27 @@ async def save_uploaded_documents_async(
     columns = await _get_documents_columns_async(db)
     if "cabinet_uuid" not in columns:
         raise RuntimeError("documents table is missing cabinet_uuid")
+    if "chunking_run_id" in columns:
+        latest_run_qry = """
+        SELECT cr.id
+        FROM cabinets c
+        JOIN chunking_runs cr ON cr.cabinet_uuid = c.cabinet_uuid
+        WHERE c.cabinet_uuid = %(cabinet_uuid)s
+        ORDER BY cr.created_at DESC, cr.id DESC
+        LIMIT 1
+        """
+        async with db.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(
+                latest_run_qry, {"cabinet_uuid": cabinet.cabinet_uuid}
+            )
+            run_row = await cursor.fetchone()
+        if run_row is None:
+            raise RuntimeError(
+                "chunking_run_id is required but no chunking run exists for cabinet"
+            )
+        latest_chunking_run_id = int(run_row["id"])
+    else:
+        latest_chunking_run_id = None
 
     items: list[DocumentListItem] = []
     now = datetime.utcnow()
@@ -1789,6 +2624,8 @@ async def save_uploaded_documents_async(
                 "path": str(target_path),
             }
             values["cabinet_uuid"] = cabinet.cabinet_uuid
+            if latest_chunking_run_id is not None:
+                values["chunking_run_id"] = latest_chunking_run_id
 
             insert_columns = []
             params: dict[str, object] = {}
@@ -2564,6 +3401,168 @@ async def fetch_cabinet_document_summary_async(
         for row in rows
     ]
     return True, total_documents, total_qa, items
+
+
+async def fetch_enquery_summary_async(db) -> dict[str, object]:
+    import aiomysql
+
+    qry = """
+    SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN action = 'WAITING' THEN 1 ELSE 0 END) AS waiting_count,
+        SUM(CASE WHEN action = 'APPROVE' THEN 1 ELSE 0 END) AS approve_count,
+        SUM(CASE WHEN action = 'EDIT' THEN 1 ELSE 0 END) AS edit_count,
+        SUM(CASE WHEN action = 'REJECT' THEN 1 ELSE 0 END) AS reject_count,
+        AVG(score) AS avg_score
+    FROM enquery_answers
+    """
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(qry)
+        row = await cursor.fetchone()
+
+    row = row or {}
+    return {
+        "total": int(row.get("total") or 0),
+        "waiting": int(row.get("waiting_count") or 0),
+        "approve": int(row.get("approve_count") or 0),
+        "edit": int(row.get("edit_count") or 0),
+        "reject": int(row.get("reject_count") or 0),
+        "avg_score": (
+            float(row["avg_score"]) if row.get("avg_score") is not None else None
+        ),
+    }
+
+
+async def fetch_enqueries_async(
+    db,
+    page: int,
+    page_size: int,
+) -> tuple[list["EnqueryItem"], int]:
+    import aiomysql
+
+    from src.model.kl_models import EnqueryCitedChunk, EnqueryItem
+
+    total_qry = "SELECT COUNT(*) AS total FROM enquery_answers"
+    list_qry = """
+    SELECT
+        id,
+        task_id,
+        channel,
+        question,
+        ai_answer,
+        human_answer,
+        final_answer,
+        action,
+        human,
+        score,
+        reason,
+        created_at,
+        updated_at
+    FROM enquery_answers
+    ORDER BY created_at DESC, id DESC
+    LIMIT %(limit)s OFFSET %(offset)s
+    """
+    offset = (page - 1) * page_size
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(total_qry)
+        total_row = await cursor.fetchone()
+        await cursor.execute(list_qry, {"limit": page_size, "offset": offset})
+        rows = await cursor.fetchall()
+
+    total_items = int((total_row or {}).get("total") or 0)
+    if not rows:
+        return [], total_items
+
+    enquery_ids = [row["id"] for row in rows]
+    if not enquery_ids:
+        return [], total_items
+    placeholders = ", ".join(["%s"] * len(enquery_ids))
+    cited_qry = f"""
+    SELECT
+        cd.enquery_task_id AS enquery_id,
+        c.id AS chunk_id,
+        c.doc_uuid AS doc_uuid,
+        c.chunk_index AS chunk_index,
+        c.content AS content,
+        d.file_name AS file_name,
+        d.file_type AS file_type,
+        d.file_size AS file_size
+    FROM cited_documents cd
+    JOIN chunks c ON c.id = cd.chunk_id
+    JOIN documents d ON d.doc_uuid = c.doc_uuid
+    WHERE cd.enquery_task_id IN ({placeholders})
+    ORDER BY cd.enquery_task_id ASC, c.chunk_index ASC, c.id ASC
+    """
+    cited_map: dict[int, list[EnqueryCitedChunk]] = {}
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(cited_qry, enquery_ids)
+        cited_rows = await cursor.fetchall()
+    for row in cited_rows:
+        enquery_id = int(row["enquery_id"])
+        cited_map.setdefault(enquery_id, []).append(
+            EnqueryCitedChunk(
+                chunk_id=row["chunk_id"],
+                doc_uuid=row["doc_uuid"],
+                chunk_index=row.get("chunk_index"),
+                content=row.get("content"),
+                file_name=row.get("file_name"),
+                file_type=row.get("file_type"),
+                file_size=row.get("file_size"),
+            )
+        )
+
+    items: list[EnqueryItem] = []
+    for row in rows:
+        items.append(
+            EnqueryItem(
+                id=row["id"],
+                task_id=row["task_id"],
+                channel=row["channel"],
+                question=row["question"],
+                ai_answer=row.get("ai_answer"),
+                human_answer=row.get("human_answer"),
+                final_answer=row.get("final_answer"),
+                action=row.get("action"),
+                human=row.get("human"),
+                score=row.get("score"),
+                reason=row.get("reason"),
+                created_at=row.get("created_at"),
+                updated_at=row.get("updated_at"),
+                cited_chunks=cited_map.get(int(row["id"]), []),
+            )
+        )
+    return items, total_items
+
+
+async def enqueue_document_pipeline_async(
+    redis_client,
+    cabinet_uuid: str,
+    items: list["DocumentListItem"],
+) -> int:
+    if not items:
+        return 0
+
+    enqueued = 0
+    for item in items:
+        fields = {
+            "doc_uuid": item.document_uuid,
+            "cabinet_uuid": cabinet_uuid,
+            "file_name": item.file_name or "",
+            "file_type": item.file_type or "",
+            "file_size": str(item.file_size or 0),
+            "uploaded_at": (
+                item.uploaded_at.isoformat()
+                if item.uploaded_at is not None
+                else ""
+            ),
+        }
+        await redis_client.xadd(
+            redis_client.stream,
+            fields,
+            maxlen=redis_client.stream_maxlen,
+        )
+        enqueued += 1
+    return enqueued
 
 
 async def fetch_cabinet_chunking_settings_async(
