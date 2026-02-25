@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     redis_pwd: str | None = Field(None, validation_alias="REDIS_PWD")
     redis_queue: str = Field("document_pipeline", validation_alias="REDIS_QUEUE")
     redis_stream: str = Field("document_pipeline", validation_alias="REDIS_STREAM")
+    redis_pipeline_status_stream: str | None = Field(
+        None, validation_alias="REDIS_PIPELINE_STATUS_STREAM"
+    )
+    # Backward-compat for deployments using REDIS_STREAM_KEY.
+    redis_stream_key: str | None = Field(None, validation_alias="REDIS_STREAM_KEY")
     redis_stream_maxlen: int | None = Field(
         None, validation_alias="REDIS_STREAM_MAXLEN"
     )
@@ -61,6 +66,12 @@ class Settings(BaseSettings):
             except json.JSONDecodeError:
                 pass
         return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def model_post_init(self, __context) -> None:
+        # If REDIS_STREAM_KEY is provided and REDIS_STREAM is left at default,
+        # prefer the key for stream name to avoid misconfiguration.
+        if self.redis_stream_key and self.redis_stream == "document_pipeline":
+            self.redis_stream = self.redis_stream_key
 
 
 settings = Settings()

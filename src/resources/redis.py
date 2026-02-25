@@ -113,9 +113,45 @@ class RedisClient:
             args.append(str(key))
             args.append(str(value))
         result = await self.execute(*args)
-        if not isinstance(result, str):
-            raise RuntimeError("Unexpected Redis XADD response")
-        return result
+        if isinstance(result, bytes):
+            return result.decode("utf-8")
+        if isinstance(result, str):
+            return result
+        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], str):
+            return result[0]
+        raise RuntimeError(f"Unexpected Redis XADD response: {result!r}")
+
+    async def xread(
+        self,
+        stream: str,
+        last_id: str,
+        block_ms: int = 1000,
+        count: int | None = None,
+    ) -> Any:
+        args: list[str] = ["XREAD", "BLOCK", str(block_ms)]
+        if count is not None:
+            args.extend(["COUNT", str(count)])
+        args.extend(["STREAMS", stream, last_id])
+        result = await self.execute(*args)
+        if result is None:
+            return []
+        # Normalize to a list of [stream_name, entries] pairs.
+        if isinstance(result, list):
+            if (
+                len(result) == 2
+                and isinstance(result[0], str)
+                and isinstance(result[1], list)
+            ):
+                return [result]
+            if all(
+                isinstance(item, list)
+                and len(item) == 2
+                and isinstance(item[0], str)
+                and isinstance(item[1], list)
+                for item in result
+            ):
+                return result
+        raise RuntimeError(f"Unexpected Redis XREAD response: {result!r}")
 
     async def execute(self, *args: str) -> Any:
         if not self._connected:

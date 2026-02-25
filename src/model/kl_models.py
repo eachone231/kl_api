@@ -386,6 +386,7 @@ class DocumentListItem(BaseModel):
     file_size: int
     status: str
     processing_step: str | None = None
+    chunking_run_id: int | None = None
     uploaded_at: datetime | None = None
 
 

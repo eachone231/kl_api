@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import logging
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,11 +9,29 @@ from src.resources.mysql import close_mysql
 from src.resources.redis import close_redis, get_redis_client
 from src.routers import api_router
 
+_LOGGING_CONFIGURED = False
+
+
+def _configure_logging() -> None:
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+    level_name = (settings.log_level or "INFO").upper()
+    level = logging.getLevelName(level_name)
+    if not isinstance(level, int):
+        level = logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    _LOGGING_CONFIGURED = True
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # Startup/shutdown hooks live here.
     try:
+        _configure_logging()
         try:
             await get_redis_client()
         except RuntimeError:

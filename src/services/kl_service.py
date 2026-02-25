@@ -2510,26 +2510,18 @@ async def save_uploaded_documents_async(
 
     base_dir = Path(cabinet.storage_base_path)
     if base_dir.is_absolute() and not _is_writable_dir(base_dir):
-        fallback_dir = (Path.cwd() / "upload").resolve()
-        if _is_writable_dir(fallback_dir):
-            base_dir = fallback_dir
-        else:
-            raise RuntimeError(
-                f"storage_base_path is not writable: {cabinet.storage_base_path}"
-            )
+        raise RuntimeError(
+            f"storage_base_path is not writable: {cabinet.storage_base_path}"
+        )
     if cabinet.storage_path:
         storage_path = Path(cabinet.storage_path)
         if storage_path.is_absolute():
             storage_path = Path(str(storage_path).lstrip("/"))
         base_dir = base_dir / storage_path
     if base_dir.is_absolute() and not _is_writable_dir(base_dir):
-        fallback_dir = (Path.cwd() / "upload").resolve()
-        if _is_writable_dir(fallback_dir):
-            base_dir = fallback_dir
-        else:
-            raise RuntimeError(
-                f"storage_base_path is not writable: {base_dir}"
-            )
+        raise RuntimeError(
+            f"storage_base_path is not writable: {base_dir}"
+        )
     logger.info(
         "upload target resolved: root=%s storage_path=%s final=%s",
         cabinet.storage_base_path,
@@ -2656,7 +2648,7 @@ async def save_uploaded_documents_async(
                     insert_columns.append(name)
                     required_missing.remove(name)
                 elif name == "processing_step":
-                    params[name] = "UPLOADED"
+                    params[name] = "UPLOAD"
                     insert_columns.append(name)
                     required_missing.remove(name)
                 elif name in ("created_at", "updated_at"):
@@ -2707,6 +2699,7 @@ async def save_uploaded_documents_async(
                     file_size=size,
                     status=str(status_value),
                     processing_step=str(step_value),
+                    chunking_run_id=latest_chunking_run_id,
                     uploaded_at=now,
                 )
             )
@@ -3539,6 +3532,9 @@ async def enqueue_document_pipeline_async(
     cabinet_uuid: str,
     items: list["DocumentListItem"],
 ) -> int:
+    import logging
+
+    logger = logging.getLogger(__name__)
     if not items:
         return 0
 
@@ -3556,10 +3552,18 @@ async def enqueue_document_pipeline_async(
                 else ""
             ),
         }
+        if item.chunking_run_id is not None:
+            fields["chunking_run_id"] = str(item.chunking_run_id)
         await redis_client.xadd(
             redis_client.stream,
             fields,
             maxlen=redis_client.stream_maxlen,
+        )
+        logger.info(
+            "redis stream enqueue: stream=%s doc_uuid=%s cabinet_uuid=%s",
+            redis_client.stream,
+            item.document_uuid,
+            cabinet_uuid,
         )
         enqueued += 1
     return enqueued

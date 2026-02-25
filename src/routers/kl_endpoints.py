@@ -9,8 +9,9 @@ from fastapi import (
     Request,
 )
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 import aiomysql
+import json
 
 from src.resources.mysql import async_get_db
 from src.model.kl_models import (
@@ -151,6 +152,7 @@ from src.services.kl_service import (
     enqueue_document_pipeline_async,
 )
 from src.resources.redis import get_redis_client
+from src.config import settings
 
 api_router = APIRouter()
 
@@ -1385,12 +1387,91 @@ async def upload_documents(
     files: list[UploadFile] = File(...),
     db: aiomysql.Connection = Depends(async_get_db),
 ):
+    import logging
+    import os
+    from pathlib import Path
+
+    logger = logging.getLogger(__name__)
     if not files or all(not (f.filename or "").strip() for f in files):
         raise HTTPException(status_code=400, detail="No files uploaded")
     cabinet = await fetch_cabinet_by_uuid_async(db, cabinet_uuid=cabinet_uuid)
     if cabinet is None:
         raise HTTPException(status_code=404, detail="Cabinet not found")
-    items = await save_uploaded_documents_async(db, cabinet=cabinet, files=files)
+    if cabinet.is_active is False:
+        raise HTTPException(status_code=403, detail="Cabinet is inactive")
+    if not cabinet.storage_base_path:
+        raise HTTPException(
+            status_code=400, detail="Cabinet storage_base_path is missing"
+        )
+    if not cabinet.storage_path:
+        raise HTTPException(
+            status_code=400, detail="Cabinet storage_path is missing"
+        )
+    if not cabinet.vector_store:
+        raise HTTPException(
+            status_code=400, detail="Cabinet vector_store is missing"
+        )
+    if cabinet.system_profile is None:
+        raise HTTPException(
+            status_code=400, detail="Cabinet system_profile is missing"
+        )
+
+    base_dir = Path(cabinet.storage_base_path)
+    rel_path = Path(cabinet.storage_path)
+    if rel_path.is_absolute():
+        raise HTTPException(
+            status_code=400, detail="Cabinet storage_path must be relative"
+        )
+    target_dir = base_dir / rel_path
+    if ".." in target_dir.parts:
+        raise HTTPException(
+            status_code=400, detail="Cabinet storage_path is invalid"
+        )
+
+    def _is_writable_dir(path: Path) -> bool:
+        if path.exists():
+            return path.is_dir() and os.access(path, os.W_OK)
+        parent = path.parent
+        return parent.exists() and os.access(parent, os.W_OK)
+
+    if base_dir.is_absolute() and not _is_writable_dir(base_dir):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Cabinet storage_base_path is not writable or accessible"
+            ),
+        )
+    if target_dir.is_absolute() and not _is_writable_dir(target_dir):
+        raise HTTPException(
+            status_code=403,
+            detail="Cabinet storage_path is not writable or accessible",
+        )
+    try:
+        items = await save_uploaded_documents_async(
+            db, cabinet=cabinet, files=files
+        )
+        # Commit before enqueue so workers can read the document row.
+        await db.commit()
+    except RuntimeError as exc:
+        logger.warning(
+            "upload failed: cabinet_uuid=%s error=%s",
+            cabinet.cabinet_uuid,
+            exc,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Upload failed: {exc}",
+        ) from exc
+    except Exception as exc:
+        logger.exception(
+            "upload failed: cabinet_uuid=%s unexpected_error=%s",
+            cabinet.cabinet_uuid,
+            exc,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Upload failed: unexpected error: {exc}",
+        ) from exc
     try:
         redis_client = await get_redis_client()
         await enqueue_document_pipeline_async(
@@ -1404,6 +1485,79 @@ async def upload_documents(
             detail=f"Failed to enqueue documents: {exc}",
         ) from exc
     return UploadDocumentsResponse(items=items)
+
+
+@api_router.get(
+    "/api/pipeline/status",
+    tags=["pipeline"],
+)
+async def pipeline_status_sse(request: Request):
+    stream = settings.redis_pipeline_status_stream
+    if not stream:
+        raise HTTPException(
+            status_code=500,
+            detail="REDIS_PIPELINE_STATUS_STREAM is not configured",
+        )
+    try:
+        redis_client = await get_redis_client()
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Redis is not configured: {exc}",
+        ) from exc
+
+    async def event_stream():
+        last_id = "$"
+        keepalive_every_ms = 15000
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                result = await redis_client.xread(
+                    stream=stream,
+                    last_id=last_id,
+                    block_ms=keepalive_every_ms,
+                    count=100,
+                )
+            except Exception as exc:
+                payload = {
+                    "error": str(exc),
+                    "stream": stream,
+                }
+                yield f"event: error\ndata: {json.dumps(payload)}\n\n"
+                break
+
+            if not result:
+                yield ": keep-alive\n\n"
+                continue
+
+            for stream_name, entries in result:
+                for entry_id, fields in entries:
+                    data = {}
+                    if isinstance(fields, list):
+                        it = iter(fields)
+                        for key in it:
+                            try:
+                                value = next(it)
+                            except StopIteration:
+                                value = ""
+                            data[str(key)] = value
+                    payload = {
+                        "stream": stream_name,
+                        "id": entry_id,
+                        "fields": data,
+                    }
+                    last_id = entry_id
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @api_router.post(
