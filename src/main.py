@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 import logging
+import os
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,3 +62,17 @@ async def request_id_middleware(request: Request, call_next):
 
 
 app.include_router(api_router)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "src.main:app",
+        host=os.getenv("UVICORN_HOST", "0.0.0.0"),
+        port=int(os.getenv("UVICORN_PORT", "8000")),
+        reload=os.getenv("UVICORN_RELOAD", "false").lower() == "true",
+        timeout_graceful_shutdown=int(
+            os.getenv("UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN", "3")
+        ),
+    )

@@ -262,6 +262,14 @@ class SystemSecretProvidersResponse(BaseModel):
     items: list[str]
 
 
+class SystemVdbPatchRequest(BaseModel):
+    env: str
+    vector_store: str
+    host: str
+    port: str
+    token: str | None = None
+
+
 class Cabinet(BaseModel):
     id: int
     project_id: int
@@ -402,6 +410,17 @@ class DocumentSummaryResponse(BaseModel):
 
 class UploadDocumentsResponse(BaseModel):
     items: list[DocumentListItem]
+
+
+class DocumentQAGenerationRequest(BaseModel):
+    doc_uuid: str
+
+
+class DocumentQAGenerationResponse(BaseModel):
+    enqueued: bool
+    doc_uuid: str
+    stream_entry_id: str | None = None
+    error: str | None = None
 
 
 class DocumentDeleteRequest(BaseModel):

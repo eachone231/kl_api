@@ -6,6 +6,95 @@ def health_status() -> dict:
     return {"status": "ok"}
 
 
+def _parse_profile_json(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        import json
+
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+async def fetch_system_db_profiles_async(db) -> dict[str, dict[str, object]]:
+    import aiomysql
+
+    qry = """
+    SELECT system_env, profile
+    FROM system_db_profile
+    """
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(qry)
+        rows = await cursor.fetchall()
+    profiles: dict[str, dict[str, object]] = {}
+    for row in rows:
+        profiles[row["system_env"]] = _parse_profile_json(row.get("profile"))
+    return profiles
+
+
+async def fetch_system_vdb_profiles_async(db) -> dict[str, dict[str, object]]:
+    import aiomysql
+
+    qry = """
+    SELECT system_env, profile
+    FROM system_vdb_profile
+    """
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(qry)
+        rows = await cursor.fetchall()
+    profiles: dict[str, dict[str, object]] = {}
+    for row in rows:
+        profiles[row["system_env"]] = _parse_profile_json(row.get("profile"))
+    return profiles
+
+
+async def upsert_system_db_profile_async(
+    db,
+    system_env: str,
+    profile: dict[str, object],
+) -> None:
+    import json
+
+    qry = """
+    INSERT INTO system_db_profile (system_env, profile, created_at, update_at)
+    VALUES (%(system_env)s, %(profile)s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    AS new_vals
+    ON DUPLICATE KEY UPDATE
+        profile = new_vals.profile,
+        update_at = CURRENT_TIMESTAMP
+    """
+    params = {"system_env": system_env, "profile": json.dumps(profile)}
+    async with db.cursor() as cursor:
+        await cursor.execute(qry, params)
+
+
+async def upsert_system_vdb_profile_async(
+    db,
+    system_env: str,
+    profile: dict[str, object],
+) -> None:
+    import json
+
+    qry = """
+    INSERT INTO system_vdb_profile (system_env, profile, created_at, updated_at)
+    VALUES (%(system_env)s, %(profile)s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    AS new_vals
+    ON DUPLICATE KEY UPDATE
+        profile = new_vals.profile,
+        updated_at = CURRENT_TIMESTAMP
+    """
+    params = {"system_env": system_env, "profile": json.dumps(profile)}
+    async with db.cursor() as cursor:
+        await cursor.execute(qry, params)
+
+
+
+
 async def fetch_models_async(
     db,
     model_type: str | None,
@@ -2367,8 +2456,14 @@ def _normalize_chunks_sort(sort: str | None) -> str:
     sort_map = {
         "created_at_desc": "ch.created_at DESC, ch.id DESC",
         "created_at_asc": "ch.created_at ASC, ch.id ASC",
-        "index_asc": "ch.chunk_index ASC, ch.id ASC",
-        "index_desc": "ch.chunk_index DESC, ch.id DESC",
+        "index_asc": (
+            "ch.chunk_index IS NULL ASC, "
+            "CAST(ch.chunk_index AS UNSIGNED) ASC, ch.id ASC"
+        ),
+        "index_desc": (
+            "ch.chunk_index IS NULL ASC, "
+            "CAST(ch.chunk_index AS UNSIGNED) DESC, ch.id DESC"
+        ),
         "doc_name_asc": "d.file_name ASC, ch.id ASC",
         "doc_name_desc": "d.file_name DESC, ch.id DESC",
         "chunk_id_asc": "ch.id ASC",
@@ -2870,37 +2965,305 @@ async def delete_document_async(
 ) -> tuple[bool, str | None]:
     import aiomysql
     import os
+    import asyncio
+    import json
+    import logging
+    from pathlib import Path
+    from urllib import request as urllib_request
+    from urllib.error import URLError, HTTPError
 
+    logger = logging.getLogger(__name__)
+
+    logger.info("delete_document start: doc_uuid=%s", document_uuid)
     info = await fetch_document_download_info_async(
         db, document_uuid=document_uuid
     )
     exists_qry = """
-    SELECT doc_uuid, processing_step
-    FROM documents
-    WHERE doc_uuid = %(document_uuid)s
+    SELECT d.doc_uuid, d.processing_step, c.vector_store, c.collection_name
+    FROM documents d
+    JOIN cabinets c ON c.cabinet_uuid = d.cabinet_uuid
+    WHERE d.doc_uuid = %(document_uuid)s
     LIMIT 1
     """
-    delete_qry = "DELETE FROM documents WHERE doc_uuid = %(document_uuid)s"
     params = {"document_uuid": document_uuid}
 
     async with db.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute(exists_qry, params)
         row = await cursor.fetchone()
         if row is None:
+            logger.info("delete_document not_found: doc_uuid=%s", document_uuid)
             return False, "not_found"
         if str(row.get("processing_step") or "").upper() == "PARSING":
+            logger.info("delete_document parsing: doc_uuid=%s", document_uuid)
             return False, "parsing"
+        vector_store = row.get("vector_store")
+        collection_name = row.get("collection_name")
+
+        await cursor.execute(
+            """
+            SELECT e.vector_id
+            FROM embeddings e
+            JOIN chunks ch ON ch.id = e.chunk_id
+            WHERE ch.doc_uuid = %(document_uuid)s
+              AND e.vector_id IS NOT NULL
+            """,
+            params,
+        )
+        vector_rows = await cursor.fetchall()
+        vector_ids = []
+        for r in vector_rows:
+            value = r.get("vector_id")
+            if value is None:
+                continue
+            if isinstance(value, (int, float)):
+                vector_ids.append(int(value))
+                continue
+            text = str(value).strip()
+            if text.isdigit():
+                vector_ids.append(int(text))
+            else:
+                vector_ids.append(text)
+        logger.info(
+            "delete_document vectors: doc_uuid=%s count=%s vector_store=%s collection=%s",
+            document_uuid,
+            len(vector_ids),
+            vector_store,
+            collection_name,
+        )
+
+    def _delete_qdrant_vectors(
+        base_url: str,
+        token: str | None,
+        collection: str,
+        ids: list[object],
+    ) -> None:
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["api-key"] = token
+        url = f"{base_url}/collections/{collection}/points/delete"
+        batch_size = 256
+        def _send(payload: bytes) -> None:
+            req = urllib_request.Request(url, data=payload, headers=headers)
+            with urllib_request.urlopen(req, timeout=10) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(f"qdrant delete failed: {resp.status}")
+
+        for i in range(0, len(ids), batch_size):
+            batch_ids = ids[i : i + batch_size]
+            legacy_payload = json.dumps({"points": batch_ids}).encode("utf-8")
+            try:
+                _send(legacy_payload)
+            except HTTPError as exc:
+                body = ""
+                try:
+                    body = exc.read().decode("utf-8")
+                except Exception:
+                    body = "<unreadable>"
+                logger.error(
+                    "qdrant delete 400: url=%s payload=%s body=%s",
+                    url,
+                    legacy_payload.decode("utf-8", errors="replace"),
+                    body,
+                )
+                if exc.code != 400:
+                    raise
+                payload = json.dumps(
+                    {"points": {"ids": batch_ids}}
+                ).encode("utf-8")
+                try:
+                    _send(payload)
+                except HTTPError as exc2:
+                    body2 = ""
+                    try:
+                        body2 = exc2.read().decode("utf-8")
+                    except Exception:
+                        body2 = "<unreadable>"
+                    logger.error(
+                        "qdrant delete 400: url=%s payload=%s body=%s",
+                        url,
+                        payload.decode("utf-8", errors="replace"),
+                        body2,
+                    )
+                    raise
+
+    async def _delete_vectors_if_needed() -> bool:
+        if not vector_ids:
+            return True
+        if not vector_store or not collection_name:
+            logger.warning(
+                "vector delete skipped: missing vector_store/collection_name"
+            )
+            return True
+
+        if str(vector_store).lower() != "qdrant":
+            logger.warning(
+                "vector delete skipped: unsupported vector_store=%s",
+                vector_store,
+            )
+            return True
+
+        from src.config import settings
+
+        profiles = await fetch_system_vdb_profiles_async(db)
+        profile = profiles.get(settings.env, {})
+        host = str(profile.get("host") or "").rstrip("/")
+        port = str(profile.get("port") or "").strip()
+        token = profile.get("token") or None
+        if isinstance(token, str) and token.startswith("ENC"):
+            from src.resources.crypto_env import decrypt_secret
+
+            token = decrypt_secret(token)
+        if not host:
+            logger.warning("vector delete skipped: qdrant host missing")
+            return True
+        if host.startswith("http://") or host.startswith("https://"):
+            base_url = host
+        else:
+            base_url = f"http://{host}"
+        if port and ":" not in base_url.rsplit("/", 1)[-1]:
+            base_url = f"{base_url}:{port}"
+
+        try:
+            await asyncio.to_thread(
+                _delete_qdrant_vectors,
+                base_url,
+                token,
+                str(collection_name),
+                vector_ids,
+            )
+        except (HTTPError, URLError, RuntimeError) as exc:
+            logger.error("vector delete failed: %s", exc)
+            return False
+        return True
+
+    if not await _delete_vectors_if_needed():
+        logger.error("delete_document vector_delete_failed: doc_uuid=%s", document_uuid)
+        return False, "vector_delete_failed"
 
     file_path = info["file_path"] if info else None
+    deleted_paths: list[str] = []
     if file_path:
         try:
             if os.path.exists(file_path):
                 os.remove(file_path)
+                deleted_paths.append(file_path)
+            logger.info(
+                "delete_document file_deleted: doc_uuid=%s path=%s",
+                document_uuid,
+                file_path,
+            )
         except OSError:
+            logger.error(
+                "delete_document file_delete_failed: doc_uuid=%s path=%s",
+                document_uuid,
+                file_path,
+            )
             return False, "file_delete_failed"
+    else:
+        logger.info("delete_document no_file: doc_uuid=%s", document_uuid)
+
+    def _unlink_path(path: str) -> bool:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                deleted_paths.append(path)
+            return True
+        except OSError:
+            logger.error(
+                "delete_document file_delete_failed: doc_uuid=%s path=%s",
+                document_uuid,
+                path,
+            )
+            return False
+
+    if info and info.get("file_name"):
+        doc_uuid = str(document_uuid)
+        base_dir = Path(file_path).parent if file_path else None
+        upload_root = (Path.cwd() / "upload").resolve()
+        targets = []
+        if base_dir:
+            targets.extend(
+                [
+                    base_dir / "html" / f"{doc_uuid}.html",
+                    base_dir / "md" / f"{doc_uuid}.md",
+                    base_dir / "imgs" / doc_uuid,
+                ]
+            )
+        targets.extend(
+            [
+                upload_root / "html" / f"{doc_uuid}.html",
+                upload_root / "md" / f"{doc_uuid}.md",
+                upload_root / "imgs" / doc_uuid,
+            ]
+        )
+        for target in targets:
+            if target.exists() and target.is_dir():
+                for child in target.iterdir():
+                    if not _unlink_path(str(child)):
+                        return False, "file_delete_failed"
+                try:
+                    target.rmdir()
+                    deleted_paths.append(str(target))
+                except OSError:
+                    logger.error(
+                        "delete_document dir_delete_failed: doc_uuid=%s path=%s",
+                        document_uuid,
+                        target,
+                    )
+                    return False, "file_delete_failed"
+            else:
+                if not _unlink_path(str(target)):
+                    return False, "file_delete_failed"
+        if deleted_paths:
+            logger.info(
+                "delete_document aux_files_deleted: doc_uuid=%s paths=%s",
+                document_uuid,
+                deleted_paths,
+            )
 
     async with db.cursor(aiomysql.DictCursor) as cursor:
-        await cursor.execute(delete_qry, params)
+        await cursor.execute(
+            """
+            DELETE qe
+            FROM qa_evaluations qe
+            JOIN qa q ON q.id = qe.qa_id
+            JOIN chunks ch ON ch.id = q.chunk_id
+            WHERE ch.doc_uuid = %(document_uuid)s
+            """,
+            params,
+        )
+        logger.info("delete_document qa_evaluations_deleted: doc_uuid=%s", document_uuid)
+        await cursor.execute(
+            """
+            DELETE q
+            FROM qa q
+            JOIN chunks ch ON ch.id = q.chunk_id
+            WHERE ch.doc_uuid = %(document_uuid)s
+            """,
+            params,
+        )
+        logger.info("delete_document qa_deleted: doc_uuid=%s", document_uuid)
+        await cursor.execute(
+            """
+            DELETE e
+            FROM embeddings e
+            JOIN chunks ch ON ch.id = e.chunk_id
+            WHERE ch.doc_uuid = %(document_uuid)s
+            """,
+            params,
+        )
+        logger.info("delete_document embeddings_deleted: doc_uuid=%s", document_uuid)
+        await cursor.execute(
+            "DELETE FROM chunks WHERE doc_uuid = %(document_uuid)s",
+            params,
+        )
+        logger.info("delete_document chunks_deleted: doc_uuid=%s", document_uuid)
+        await cursor.execute(
+            "DELETE FROM documents WHERE doc_uuid = %(document_uuid)s",
+            params,
+        )
+        logger.info("delete_document document_deleted: doc_uuid=%s", document_uuid)
+    logger.info("delete_document complete: doc_uuid=%s", document_uuid)
     return True, None
 
 
@@ -3229,17 +3592,6 @@ async def fetch_cabinet_qa_list_async(
     ORDER BY d.created_at DESC, qa.created_at DESC, qa.id DESC
     LIMIT %(offset)s, %(limit)s
     """
-    evaluations_qry = """
-    SELECT
-        qe.qa_id AS qa_id,
-        qe.evaluator_type AS evaluator_type,
-        qe.score AS score,
-        qe.feedback AS feedback,
-        qe.created_at AS evaluated_at
-    FROM qa_evaluations qe
-    WHERE qe.qa_id IN ({qa_ids})
-    ORDER BY qe.qa_id DESC, qe.created_at DESC
-    """
     offset = (page - 1) * page_size
     params = {
         "cabinet_uuid": cabinet_uuid,
@@ -3284,14 +3636,22 @@ async def fetch_cabinet_qa_list_async(
         qa_id_placeholders = ", ".join(
             [f"%({index})s" for index in range(len(ordered_ids))]
         )
+        evaluations_qry = f"""
+        SELECT
+            qe.qa_id AS qa_id,
+            qe.evaluator_type AS evaluator_type,
+            qe.score AS score,
+            qe.feedback AS feedback,
+            qe.created_at AS evaluated_at
+        FROM qa_evaluations qe
+        WHERE qe.qa_id IN ({qa_id_placeholders})
+        ORDER BY qe.qa_id DESC, qe.created_at DESC
+        """
         qa_id_params = {
             str(index): qa_id for index, qa_id in enumerate(ordered_ids)
         }
         async with db.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute(
-                evaluations_qry.format(qa_ids=qa_id_placeholders),
-                qa_id_params,
-            )
+            await cursor.execute(evaluations_qry, qa_id_params)
             evaluation_rows = await cursor.fetchall()
         for row in evaluation_rows:
             qa_id = int(row["qa_id"])
@@ -3541,6 +3901,7 @@ async def enqueue_document_pipeline_async(
     enqueued = 0
     for item in items:
         fields = {
+            "type": "ingestion",
             "doc_uuid": item.document_uuid,
             "cabinet_uuid": cabinet_uuid,
             "file_name": item.file_name or "",
@@ -3560,13 +3921,31 @@ async def enqueue_document_pipeline_async(
             maxlen=redis_client.stream_maxlen,
         )
         logger.info(
-            "redis stream enqueue: stream=%s doc_uuid=%s cabinet_uuid=%s",
+            "redis stream enqueue: stream=%s type=%s doc_uuid=%s cabinet_uuid=%s",
             redis_client.stream,
+            fields.get("type"),
             item.document_uuid,
             cabinet_uuid,
         )
         enqueued += 1
     return enqueued
+
+
+async def enqueue_document_qa_generation_async(
+    redis_client,
+    doc_uuid: str,
+    stream: str,
+) -> str:
+    if not doc_uuid.strip():
+        raise RuntimeError("doc_uuid is required")
+    return await redis_client.xadd(
+        stream,
+        {
+            "type": "qa_generation",
+            "doc_uuid": doc_uuid.strip(),
+        },
+        maxlen=redis_client.stream_maxlen,
+    )
 
 
 async def fetch_cabinet_chunking_settings_async(

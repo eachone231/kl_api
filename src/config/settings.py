@@ -4,6 +4,7 @@ from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from src.resources.crypto_env import decrypt_secret
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 
@@ -17,14 +18,24 @@ class Settings(BaseSettings):
 
     app_name: str = "kl_api"
     env: str = "local"
+    expose_internal_error_detail: bool = Field(
+        False,
+        validation_alias="EXPOSE_INTERNAL_ERROR_DETAIL",
+    )
     cors_origins: list[str] = ["*"]
     log_level: str = "INFO"
-    db_host: str = "127.0.0.1"
-    db_port: int = 3306
-    db_user: str = "root"
-    db_pwd: str = ""
-    db_name: str = "kl_api"
+    db_host: str = Field("127.0.0.1", validation_alias="DB_HOST")
+    db_port: int = Field(3306, validation_alias="DB_PORT")
+    db_user: str = Field("root", validation_alias="DB_USER")
+    db_pwd: str = Field("", validation_alias="DB_PWD")
+    db_name: str = Field("kl_api", validation_alias="DATABASE")
     db_auth_plugin: str | None = None
+    db_connect_timeout: float = Field(5.0, validation_alias="DB_CONNECT_TIMEOUT")
+    db_read_timeout: float = Field(10.0, validation_alias="DB_READ_TIMEOUT")
+    db_write_timeout: float = Field(10.0, validation_alias="DB_WRITE_TIMEOUT")
+    db_pool_acquire_timeout: float = Field(
+        5.0, validation_alias="DB_POOL_ACQUIRE_TIMEOUT"
+    )
     smtp_host: str = Field("smtp.gmail.com", validation_alias="SMTP_HOST")
     smtp_port: int = Field(587, validation_alias="SMTP_PORT")
     smtp_user: str | None = Field(None, validation_alias="SMTP_USER")
@@ -78,13 +89,19 @@ settings = Settings()
 
 
 def build_mysql_aiomysql_config() -> dict[str, object]:
+    password = settings.db_pwd
+    if isinstance(password, str) and password.startswith("ENC"):
+        password = decrypt_secret(password)
     config = {
         "host": settings.db_host,
-        "port": settings.db_port,
+        "port": int(settings.db_port),
         "user": settings.db_user,
-        "password": settings.db_pwd,
+        "password": password,
         "db": settings.db_name,
         "charset": "utf8mb4",
+        "connect_timeout": settings.db_connect_timeout,
+        "read_timeout": settings.db_read_timeout,
+        "write_timeout": settings.db_write_timeout,
     }
     if settings.db_auth_plugin:
         config["auth_plugin"] = settings.db_auth_plugin

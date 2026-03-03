@@ -64,7 +64,10 @@ class RedisClient:
         if self._writer is not None:
             self._writer.close()
             try:
-                await self._writer.wait_closed()
+                await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
+            except TimeoutError:
+                # Do not block shutdown/reload forever on a stuck socket close.
+                pass
             except Exception:
                 pass
         self._reader = None
@@ -119,7 +122,11 @@ class RedisClient:
             return result
         if isinstance(result, list) and len(result) == 1 and isinstance(result[0], str):
             return result[0]
-        raise RuntimeError(f"Unexpected Redis XADD response: {result!r}")
+        raise RuntimeError(
+            "Unexpected Redis XADD response: "
+            f"{result!r}. This may indicate a desynchronized shared Redis "
+            "connection; use a dedicated client for blocking XREAD calls."
+        )
 
     async def xread(
         self,
@@ -223,13 +230,21 @@ def _build_redis_url() -> str | None:
 
 _redis_client: RedisClient | None = None
 _redis_url = _build_redis_url()
-if _redis_url:
-    _redis_client = RedisClient(
+
+
+def build_redis_client() -> RedisClient:
+    if not _redis_url:
+        raise RuntimeError("REDIS_URL is not configured")
+    return RedisClient(
         _redis_url,
         settings.redis_queue,
         settings.redis_stream,
         settings.redis_stream_maxlen,
     )
+
+
+if _redis_url:
+    _redis_client = build_redis_client()
 
 
 async def get_redis_client() -> RedisClient:

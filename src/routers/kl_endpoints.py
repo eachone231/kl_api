@@ -10,8 +10,11 @@ from fastapi import (
 )
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, StreamingResponse
+from pathlib import Path
+from datetime import datetime, timezone
 import aiomysql
 import json
+import tempfile
 
 from src.resources.mysql import async_get_db
 from src.model.kl_models import (
@@ -30,6 +33,8 @@ from src.model.kl_models import (
     QAListResponse,
     QAEvaluationCreateRequest,
     QAEvaluationCreateResponse,
+    DocumentQAGenerationRequest,
+    DocumentQAGenerationResponse,
     DocumentSummaryResponse,
     DocumentsResponse,
     ChunksResponse,
@@ -78,6 +83,7 @@ from src.model.kl_models import (
     SystemSecretsResponse,
     SystemEnvironmentsResponse,
     SystemSecretProvidersResponse,
+    SystemVdbPatchRequest,
     UploadDocumentsResponse,
     UserCreateRequest,
     UserResponse,
@@ -120,10 +126,12 @@ from src.services.kl_service import (
     fetch_system_secret_async,
     fetch_system_secrets_async,
     fetch_system_environments_async,
+    fetch_system_vdb_profiles_async,
     fetch_system_secret_providers_async,
     create_system_secret_async,
     rotate_system_secret_async,
     delete_system_secret_async,
+    upsert_system_vdb_profile_async,
     health_status,
     fetch_documents_async,
     fetch_document_download_info_async,
@@ -149,12 +157,44 @@ from src.services.kl_service import (
     confirm_user_reset_token_async,
     fetch_enquery_summary_async,
     fetch_enqueries_async,
+    enqueue_document_qa_generation_async,
     enqueue_document_pipeline_async,
 )
-from src.resources.redis import get_redis_client
+from src.resources.crypto_env import encrypt_secret
+from src.resources.redis import build_redis_client, get_redis_client
 from src.config import settings
 
 api_router = APIRouter()
+_RESOURCE_DIR = Path(__file__).resolve().parents[1] / "resources"
+
+
+def _load_resource_json(filename: str):
+    path = _RESOURCE_DIR / filename
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Invalid JSON resource")
+
+
+def _write_resource_json(filename: str, data):
+    path = _RESOURCE_DIR / filename
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+    except OSError:
+        raise HTTPException(status_code=500, detail="Failed to write resource")
 
 
 @api_router.get("/")
@@ -778,6 +818,63 @@ async def get_vector_stores(
     return VectorStoresResponse(items=items)
 
 
+@api_router.get("/api/system/vdb", tags=["system"])
+async def get_system_vdb(
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    envs = await fetch_system_environments_async(db)
+    profiles = await fetch_system_vdb_profiles_async(db)
+    response = {
+        "vector_stores": [
+            "qdrant",
+            "chromadb",
+            "weaviate",
+            "milvus",
+            "faiss",
+            "pinecone",
+        ]
+    }
+    for env in envs:
+        profile = profiles.get(env, {})
+        response[env] = {
+            "vector_store": profile.get("vector_store", ""),
+            "host": profile.get("host", ""),
+            "port": profile.get("port", ""),
+            "token": profile.get("token", ""),
+            "updated_at": profile.get("updated_at", ""),
+        }
+    return response
+
+
+@api_router.patch("/api/system/vdb", tags=["system"])
+async def patch_system_vdb(
+    payload: SystemVdbPatchRequest,
+    db: aiomysql.Connection = Depends(async_get_db),
+):
+    envs = await fetch_system_environments_async(db)
+    env = payload.env
+    if env not in envs:
+        raise HTTPException(status_code=400, detail="Invalid env")
+    existing_profiles = await fetch_system_vdb_profiles_async(db)
+    existing = existing_profiles.get(env, {})
+    token = payload.token
+    if token is None:
+        token = existing.get("token", "")
+    elif token == "":
+        token = ""
+    elif token.startswith("ENC"):
+        token = existing.get("token", "")
+    profile = {
+        "vector_store": payload.vector_store,
+        "host": payload.host,
+        "port": payload.port,
+        "token": encrypt_secret(token) if token else "",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await upsert_system_vdb_profile_async(db, env, profile)
+    return profile
+
+
 @api_router.post(
     "/api/system/secret/view",
     tags=["system_secrets"],
@@ -1378,6 +1475,41 @@ async def get_cabinet_document_summary(
 
 
 @api_router.post(
+    "/api/document/qa-gen",
+    tags=["documents"],
+    response_model=DocumentQAGenerationResponse,
+)
+async def enqueue_document_qa_generation(
+    payload: DocumentQAGenerationRequest,
+):
+    stream = settings.redis_stream_key or settings.redis_stream
+    if not stream:
+        return DocumentQAGenerationResponse(
+            enqueued=False,
+            doc_uuid=payload.doc_uuid,
+            error="REDIS_STREAM_KEY is not configured",
+        )
+    try:
+        redis_client = await get_redis_client()
+        entry_id = await enqueue_document_qa_generation_async(
+            redis_client=redis_client,
+            doc_uuid=payload.doc_uuid,
+            stream=stream,
+        )
+    except Exception as exc:
+        return DocumentQAGenerationResponse(
+            enqueued=False,
+            doc_uuid=payload.doc_uuid,
+            error=str(exc),
+        )
+    return DocumentQAGenerationResponse(
+        enqueued=True,
+        doc_uuid=payload.doc_uuid,
+        stream_entry_id=entry_id,
+    )
+
+
+@api_router.post(
     "/api/documents/upload",
     tags=["documents"],
     response_model=UploadDocumentsResponse,
@@ -1392,8 +1524,31 @@ async def upload_documents(
     from pathlib import Path
 
     logger = logging.getLogger(__name__)
+
+    def _should_expose_error_detail() -> bool:
+        return settings.expose_internal_error_detail or settings.env.lower() in {
+            "local",
+            "dev",
+            "development",
+        }
+
+    def _error_detail(prefix: str, exc: Exception) -> str:
+        if _should_expose_error_detail():
+            return f"{prefix}: {exc.__class__.__name__}: {exc}"
+        return prefix
+
     if not files or all(not (f.filename or "").strip() for f in files):
         raise HTTPException(status_code=400, detail="No files uploaded")
+    for file in files:
+        filename = (file.filename or "").strip().lower()
+        content_type = (file.content_type or "").strip().lower()
+        is_pdf_name = filename.endswith(".pdf")
+        is_pdf_type = content_type in ("application/pdf", "application/x-pdf")
+        if not (is_pdf_name or is_pdf_type):
+            raise HTTPException(
+                status_code=400,
+                detail="PDF 형식의 파일만 지원합니다. PDF 형식으로 변환하여 등록해주십시요.",
+            )
     cabinet = await fetch_cabinet_by_uuid_async(db, cabinet_uuid=cabinet_uuid)
     if cabinet is None:
         raise HTTPException(status_code=404, detail="Cabinet not found")
@@ -1470,7 +1625,7 @@ async def upload_documents(
         )
         raise HTTPException(
             status_code=500,
-            detail=f"Upload failed: unexpected error: {exc}",
+            detail=_error_detail("Upload failed: unexpected error", exc),
         ) from exc
     try:
         redis_client = await get_redis_client()
@@ -1480,9 +1635,27 @@ async def upload_documents(
             items=items,
         )
     except RuntimeError as exc:
+        logger.exception(
+            "enqueue failed: cabinet_uuid=%s runtime_error=%s",
+            cabinet.cabinet_uuid,
+            exc,
+        )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to enqueue documents: {exc}",
+            detail=_error_detail("Failed to enqueue documents", exc),
+        ) from exc
+    except Exception as exc:
+        logger.exception(
+            "enqueue failed: cabinet_uuid=%s unexpected_error=%s",
+            cabinet.cabinet_uuid,
+            exc,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=_error_detail(
+                "Failed to enqueue documents: unexpected error",
+                exc,
+            ),
         ) from exc
     return UploadDocumentsResponse(items=items)
 
@@ -1499,7 +1672,8 @@ async def pipeline_status_sse(request: Request):
             detail="REDIS_PIPELINE_STATUS_STREAM is not configured",
         )
     try:
-        redis_client = await get_redis_client()
+        redis_client = build_redis_client()
+        await redis_client.connect()
     except RuntimeError as exc:
         raise HTTPException(
             status_code=500,
@@ -1508,47 +1682,50 @@ async def pipeline_status_sse(request: Request):
 
     async def event_stream():
         last_id = "$"
-        keepalive_every_ms = 15000
-        while True:
-            if await request.is_disconnected():
-                break
-            try:
-                result = await redis_client.xread(
-                    stream=stream,
-                    last_id=last_id,
-                    block_ms=keepalive_every_ms,
-                    count=100,
-                )
-            except Exception as exc:
-                payload = {
-                    "error": str(exc),
-                    "stream": stream,
-                }
-                yield f"event: error\ndata: {json.dumps(payload)}\n\n"
-                break
-
-            if not result:
-                yield ": keep-alive\n\n"
-                continue
-
-            for stream_name, entries in result:
-                for entry_id, fields in entries:
-                    data = {}
-                    if isinstance(fields, list):
-                        it = iter(fields)
-                        for key in it:
-                            try:
-                                value = next(it)
-                            except StopIteration:
-                                value = ""
-                            data[str(key)] = value
+        keepalive_every_ms = 30000
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    result = await redis_client.xread(
+                        stream=stream,
+                        last_id=last_id,
+                        block_ms=keepalive_every_ms,
+                        count=100,
+                    )
+                except Exception as exc:
                     payload = {
-                        "stream": stream_name,
-                        "id": entry_id,
-                        "fields": data,
+                        "error": str(exc),
+                        "stream": stream,
                     }
-                    last_id = entry_id
-                    yield f"data: {json.dumps(payload)}\n\n"
+                    yield f"event: error\ndata: {json.dumps(payload)}\n\n"
+                    break
+
+                if not result:
+                    yield ": keep-alive\n\n"
+                    continue
+
+                for stream_name, entries in result:
+                    for entry_id, fields in entries:
+                        data = {}
+                        if isinstance(fields, list):
+                            it = iter(fields)
+                            for key in it:
+                                try:
+                                    value = next(it)
+                                except StopIteration:
+                                    value = ""
+                                data[str(key)] = value
+                        payload = {
+                            "stream": stream_name,
+                            "id": entry_id,
+                            "fields": data,
+                        }
+                        last_id = entry_id
+                        yield f"data: {json.dumps(payload)}\n\n"
+        finally:
+            await redis_client.close()
 
     return StreamingResponse(
         event_stream(),
