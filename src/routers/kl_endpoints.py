@@ -1583,6 +1583,18 @@ async def upload_documents(
             status_code=400, detail="Cabinet storage_path is invalid"
         )
 
+    logger.info(
+        "upload validation paths: cabinet_uuid=%s base=%r storage_path=%r target=%r base_exists=%s base_is_dir=%s target_exists=%s target_parent=%r",
+        cabinet.cabinet_uuid,
+        cabinet.storage_base_path,
+        cabinet.storage_path,
+        str(target_dir),
+        base_dir.exists(),
+        base_dir.is_dir(),
+        target_dir.exists(),
+        str(target_dir.parent),
+    )
+
     def _is_writable_dir(path: Path) -> bool:
         if path.exists():
             return path.is_dir() and os.access(path, os.W_OK)
@@ -1590,6 +1602,17 @@ async def upload_documents(
         return parent.exists() and os.access(parent, os.W_OK)
 
     if base_dir.is_absolute() and not _is_writable_dir(base_dir):
+        logger.warning(
+            "upload validation failed: cabinet_uuid=%s base=%r exists=%s is_dir=%s writable=%s parent=%r parent_exists=%s parent_writable=%s",
+            cabinet.cabinet_uuid,
+            cabinet.storage_base_path,
+            base_dir.exists(),
+            base_dir.is_dir(),
+            os.access(base_dir, os.W_OK),
+            str(base_dir.parent),
+            base_dir.parent.exists(),
+            os.access(base_dir.parent, os.W_OK),
+        )
         raise HTTPException(
             status_code=403,
             detail=(
@@ -1597,6 +1620,17 @@ async def upload_documents(
             ),
         )
     if target_dir.is_absolute() and not _is_writable_dir(target_dir):
+        logger.warning(
+            "upload validation failed: cabinet_uuid=%s target=%r exists=%s is_dir=%s writable=%s parent=%r parent_exists=%s parent_writable=%s",
+            cabinet.cabinet_uuid,
+            str(target_dir),
+            target_dir.exists(),
+            target_dir.is_dir(),
+            os.access(target_dir, os.W_OK),
+            str(target_dir.parent),
+            target_dir.parent.exists(),
+            os.access(target_dir.parent, os.W_OK),
+        )
         raise HTTPException(
             status_code=403,
             detail="Cabinet storage_path is not writable or accessible",
