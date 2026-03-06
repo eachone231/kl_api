@@ -159,6 +159,7 @@ from src.services.kl_service import (
     fetch_enqueries_async,
     enqueue_document_qa_generation_async,
     enqueue_document_pipeline_async,
+    enqueue_cabinet_collection_delete_async,
 )
 from src.resources.crypto_env import encrypt_secret
 from src.resources.redis import build_redis_client, get_redis_client
@@ -1051,6 +1052,12 @@ async def delete_cabinet(
     payload: CabinetDeleteRequest,
     db: aiomysql.Connection = Depends(async_get_db),
 ):
+    import logging
+
+    logger = logging.getLogger(__name__)
+    cabinet = await fetch_cabinet_by_uuid_async(
+        db, cabinet_uuid=payload.cabinet_uuid
+    )
     deleted, reason = await delete_cabinet_async(
         db, cabinet_uuid=payload.cabinet_uuid
     )
@@ -1062,6 +1069,37 @@ async def delete_cabinet(
                 status_code=409, detail="Cabinet has documents"
             )
         raise HTTPException(status_code=500, detail="Failed to delete cabinet")
+    await db.commit()
+
+    if cabinet is not None:
+        try:
+            redis_client = await get_redis_client()
+            await enqueue_cabinet_collection_delete_async(
+                redis_client=redis_client,
+                cabinet_uuid=cabinet.cabinet_uuid,
+                vector_store=cabinet.vector_store,
+                collection_name=cabinet.collection_name,
+            )
+        except RuntimeError as exc:
+            logger.error(
+                "cabinet delete enqueue failed: cabinet_uuid=%s runtime_error=%s",
+                payload.cabinet_uuid,
+                exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Cabinet deleted but failed to enqueue collection deletion",
+            )
+        except Exception as exc:
+            logger.exception(
+                "cabinet delete enqueue failed: cabinet_uuid=%s unexpected_error=%s",
+                payload.cabinet_uuid,
+                exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Cabinet deleted but failed to enqueue collection deletion",
+            )
     return CabinetDeleteResponse(deleted=True)
 
 

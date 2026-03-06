@@ -3036,7 +3036,10 @@ async def delete_document_async(
         token: str | None,
         collection: str,
         ids: list[object],
+        document_uuid: str,
     ) -> None:
+        import re
+
         headers = {"Content-Type": "application/json"}
         if token:
             headers["api-key"] = token
@@ -3048,11 +3051,35 @@ async def delete_document_async(
                 if resp.status >= 400:
                     raise RuntimeError(f"qdrant delete failed: {resp.status}")
 
-        for i in range(0, len(ids), batch_size):
-            batch_ids = ids[i : i + batch_size]
+        uuid_pattern = re.compile(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+            r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+        )
+
+        def _is_supported_point_id(value: object) -> bool:
+            if isinstance(value, int):
+                return True
+            if isinstance(value, str):
+                return bool(uuid_pattern.match(value.strip()))
+            return False
+
+        valid_ids = [point_id for point_id in ids if _is_supported_point_id(point_id)]
+        invalid_count = len(ids) - len(valid_ids)
+        if invalid_count > 0:
+            logger.warning(
+                "qdrant delete ids contain unsupported formats: total=%s valid=%s invalid=%s",
+                len(ids),
+                len(valid_ids),
+                invalid_count,
+            )
+
+        deleted = False
+        for i in range(0, len(valid_ids), batch_size):
+            batch_ids = valid_ids[i : i + batch_size]
             legacy_payload = json.dumps({"points": batch_ids}).encode("utf-8")
             try:
                 _send(legacy_payload)
+                deleted = True
             except HTTPError as exc:
                 body = ""
                 try:
@@ -3072,6 +3099,7 @@ async def delete_document_async(
                 ).encode("utf-8")
                 try:
                     _send(payload)
+                    deleted = True
                 except HTTPError as exc2:
                     body2 = ""
                     try:
@@ -3085,6 +3113,87 @@ async def delete_document_async(
                         body2,
                     )
                     raise
+
+        if deleted:
+            return
+
+        # Fallback for deployments storing non-Qdrant-native vector_id values
+        # (for example "doc:<uuid>:chunk:<n>"). In that case remove points by payload.
+        filter_candidates = [
+            {
+                "points": {
+                    "filter": {
+                        "must": [
+                            {
+                                "key": "doc_uuid",
+                                "match": {"value": document_uuid},
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "filter": {
+                    "must": [
+                        {"key": "doc_uuid", "match": {"value": document_uuid}}
+                    ]
+                }
+            },
+            {
+                "points": {
+                    "filter": {
+                        "must": [
+                            {
+                                "key": "document_uuid",
+                                "match": {"value": document_uuid},
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "filter": {
+                    "must": [
+                        {
+                            "key": "document_uuid",
+                            "match": {"value": document_uuid},
+                        }
+                    ]
+                }
+            },
+        ]
+
+        last_error: Exception | None = None
+        for body_obj in filter_candidates:
+            payload = json.dumps(body_obj).encode("utf-8")
+            try:
+                _send(payload)
+                logger.info(
+                    "qdrant delete fallback succeeded: collection=%s doc_uuid=%s payload=%s",
+                    collection,
+                    document_uuid,
+                    json.dumps(body_obj, ensure_ascii=False),
+                )
+                return
+            except HTTPError as exc:
+                last_error = exc
+                body = ""
+                try:
+                    body = exc.read().decode("utf-8")
+                except Exception:
+                    body = "<unreadable>"
+                logger.error(
+                    "qdrant delete fallback 400: url=%s payload=%s body=%s",
+                    url,
+                    payload.decode("utf-8", errors="replace"),
+                    body,
+                )
+            except Exception as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("qdrant delete failed: no valid ids and no filter fallback")
 
     async def _delete_vectors_if_needed() -> bool:
         if not vector_ids:
@@ -3130,6 +3239,7 @@ async def delete_document_async(
                 token,
                 str(collection_name),
                 vector_ids,
+                document_uuid,
             )
         except (HTTPError, URLError, RuntimeError) as exc:
             logger.error("vector delete failed: %s", exc)
@@ -3946,6 +4056,50 @@ async def enqueue_document_qa_generation_async(
         },
         maxlen=redis_client.stream_maxlen,
     )
+
+
+async def enqueue_cabinet_collection_delete_async(
+    redis_client,
+    cabinet_uuid: str,
+    vector_store: str | None,
+    collection_name: str | None,
+) -> str | None:
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    if not cabinet_uuid.strip():
+        raise RuntimeError("cabinet_uuid is required")
+
+    normalized_store = (vector_store or "").strip()
+    normalized_collection = (collection_name or "").strip()
+    if not normalized_store or not normalized_collection:
+        logger.info(
+            "redis stream enqueue skipped: cabinet collection delete missing metadata cabinet_uuid=%s vector_store=%s collection_name=%s",
+            cabinet_uuid,
+            vector_store,
+            collection_name,
+        )
+        return None
+
+    entry_id = await redis_client.xadd(
+        redis_client.stream,
+        {
+            "type": "cabinet_collection_delete",
+            "cabinet_uuid": cabinet_uuid.strip(),
+            "vector_store": normalized_store,
+            "collection_name": normalized_collection,
+        },
+        maxlen=redis_client.stream_maxlen,
+    )
+    logger.info(
+        "redis stream enqueue: stream=%s type=%s cabinet_uuid=%s collection_name=%s",
+        redis_client.stream,
+        "cabinet_collection_delete",
+        cabinet_uuid,
+        normalized_collection,
+    )
+    return entry_id
 
 
 async def fetch_cabinet_chunking_settings_async(
