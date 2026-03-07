@@ -2,15 +2,27 @@ from contextlib import asynccontextmanager
 import logging
 import os
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from src.config import settings
+from src.resources.auth import verify_access_token
 from src.resources.mysql import close_mysql
 from src.resources.redis import close_redis, get_redis_client
 from src.routers import api_router
 
 _LOGGING_CONFIGURED = False
+_PUBLIC_PATHS = {
+    "/",
+    "/health",
+    "/status",
+    "/api/login",
+    "/api/user",
+    "/api/user/reset",
+    "/api/user/reset/confirm",
+    "/api/pipeline/status",
+}
 
 
 def _configure_logging() -> None:
@@ -56,6 +68,33 @@ app.add_middleware(
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
+    if request.method == "OPTIONS":
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = request.headers.get("X-Request-Id", "")
+        return response
+
+    path = request.url.path
+    if settings.auth_enabled and path.startswith("/api") and path not in _PUBLIC_PATHS:
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing Bearer token"},
+            )
+        token = auth_header.split(" ", 1)[1].strip()
+        if not token:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing Bearer token"},
+            )
+        try:
+            request.state.auth_user = verify_access_token(token)
+        except HTTPException:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or expired token"},
+            )
+
     response = await call_next(request)
     response.headers["X-Request-Id"] = request.headers.get("X-Request-Id", "")
     return response

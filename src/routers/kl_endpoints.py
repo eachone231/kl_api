@@ -162,6 +162,7 @@ from src.services.kl_service import (
     enqueue_cabinet_collection_delete_async,
 )
 from src.resources.crypto_env import encrypt_secret
+from src.resources.auth import create_access_token
 from src.resources.redis import build_redis_client, get_redis_client
 from src.config import settings
 
@@ -240,6 +241,11 @@ async def login(
             username=user["username"],
             email=user["email"],
         ),
+        access_token=create_access_token(
+            emp_id=user["emp_id"],
+            email=user["email"],
+        ),
+        token_type="bearer",
         message="OK",
     )
 

@@ -338,6 +338,8 @@ class LoginData(BaseModel):
 class LoginResponse(BaseModel):
     code: int
     data: LoginData | None = None
+    access_token: str | None = None
+    token_type: str | None = None
     message: str | None = None
 
 
@@ -395,12 +397,19 @@ class DocumentListItem(BaseModel):
     status: str
     processing_step: str | None = None
     chunking_run_id: int | None = None
+    document_status: list["DocumentStatusItem"] = Field(default_factory=list)
     uploaded_at: datetime | None = None
 
 
 class DocumentsResponse(BaseModel):
     items: list[DocumentListItem]
     page_info: PageInfo
+
+
+class DocumentStatusItem(BaseModel):
+    processing_step: str | None = None
+    processing_status: str | None = None
+    created_at: datetime | None = None
 
 
 class DocumentSummaryResponse(BaseModel):

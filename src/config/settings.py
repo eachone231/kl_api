@@ -22,7 +22,7 @@ class Settings(BaseSettings):
         False,
         validation_alias="EXPOSE_INTERNAL_ERROR_DETAIL",
     )
-    cors_origins: list[str] = ["*"]
+    cors_origins: list[str] = ["http://localhost:5173","http://127.0.0.1:5173"]
     log_level: str = "INFO"
     db_host: str = Field("127.0.0.1", validation_alias="DB_HOST")
     db_port: int = Field(3306, validation_alias="DB_PORT")
@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     redis_stream_maxlen: int | None = Field(
         None, validation_alias="REDIS_STREAM_MAXLEN"
     )
+    jwt_secret_key: str = Field("change-me", validation_alias="JWT_SECRET_KEY")
+    jwt_algorithm: str = Field("HS256", validation_alias="JWT_ALGORITHM")
+    jwt_expire_min: int = Field(60, validation_alias="JWT_EXPIRE_MIN")
+    auth_enabled: bool = Field(True, validation_alias="AUTH_ENABLED")
 
     @field_validator("cors_origins", mode="before")
     @classmethod

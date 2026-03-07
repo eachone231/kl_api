@@ -2814,7 +2814,7 @@ async def fetch_documents_async(
 ) -> tuple[list["DocumentListItem"], int]:
     import aiomysql
 
-    from src.model.kl_models import DocumentListItem
+    from src.model.kl_models import DocumentListItem, DocumentStatusItem
 
     join_sql = ""
     where_clauses = ["1=1"]
@@ -2838,6 +2838,11 @@ async def fetch_documents_async(
     sort_sql = _normalize_documents_sort(sort)
     offset = (page - 1) * page_size
     params.update({"offset": offset, "limit": page_size})
+    document_columns = await _get_table_columns_async(db, "documents")
+    has_chunking_run_id = "chunking_run_id" in document_columns
+    select_chunking_run_sql = (
+        "d.chunking_run_id," if has_chunking_run_id else "NULL AS chunking_run_id,"
+    )
 
     count_qry = f"""
     SELECT COUNT(*) AS total
@@ -2853,6 +2858,7 @@ async def fetch_documents_async(
         d.file_size,
         d.status,
         d.processing_step,
+        {select_chunking_run_sql}
         d.created_at
     FROM documents d
     {join_sql}
@@ -2868,6 +2874,53 @@ async def fetch_documents_async(
         await cursor.execute(list_qry, params)
         rows = await cursor.fetchall()
 
+    status_map: dict[str, list[DocumentStatusItem]] = {}
+    document_uuids = [
+        str(row["document_uuid"]) for row in rows if row.get("document_uuid") is not None
+    ]
+    status_columns = await _get_table_columns_async(db, "documents_status")
+    if document_uuids and {"doc_uuid", "processing_step", "processing_status"}.issubset(
+        status_columns
+    ):
+        has_status_created_at = "created_at" in status_columns
+        has_status_id = "id" in status_columns
+        select_status_created_at_sql = (
+            "ds.created_at" if has_status_created_at else "NULL AS created_at"
+        )
+        order_parts: list[str] = []
+        if has_status_created_at:
+            order_parts.append("ds.created_at ASC")
+        if has_status_id:
+            order_parts.append("ds.id ASC")
+        if not order_parts:
+            order_parts.append("ds.doc_uuid ASC")
+        order_sql = ", ".join(order_parts)
+
+        placeholders = ", ".join(["%s"] * len(document_uuids))
+        statuses_qry = f"""
+        SELECT
+            ds.doc_uuid AS document_uuid,
+            ds.processing_step,
+            ds.processing_status,
+            {select_status_created_at_sql}
+        FROM documents_status ds
+        WHERE ds.doc_uuid IN ({placeholders})
+        ORDER BY ds.doc_uuid ASC, {order_sql}
+        """
+        async with db.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(statuses_qry, document_uuids)
+            status_rows = await cursor.fetchall()
+
+        for row in status_rows:
+            doc_uuid = str(row["document_uuid"])
+            status_map.setdefault(doc_uuid, []).append(
+                DocumentStatusItem(
+                    processing_step=row.get("processing_step"),
+                    processing_status=row.get("processing_status"),
+                    created_at=row.get("created_at"),
+                )
+            )
+
     items = [
         DocumentListItem(
             document_uuid=row["document_uuid"],
@@ -2876,6 +2929,8 @@ async def fetch_documents_async(
             file_size=row["file_size"],
             status=row["status"],
             processing_step=row["processing_step"],
+            chunking_run_id=row.get("chunking_run_id"),
+            document_status=status_map.get(str(row["document_uuid"]), []),
             uploaded_at=row["created_at"],
         )
         for row in rows
