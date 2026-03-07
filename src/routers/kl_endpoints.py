@@ -157,6 +157,7 @@ from src.services.kl_service import (
     confirm_user_reset_token_async,
     fetch_enquery_summary_async,
     fetch_enqueries_async,
+    has_ai_generated_qa_for_document_async,
     enqueue_document_qa_generation_async,
     enqueue_document_pipeline_async,
     enqueue_cabinet_collection_delete_async,
@@ -1525,6 +1526,7 @@ async def get_cabinet_document_summary(
 )
 async def enqueue_document_qa_generation(
     payload: DocumentQAGenerationRequest,
+    db: aiomysql.Connection = Depends(async_get_db),
 ):
     stream = settings.redis_stream_key or settings.redis_stream
     if not stream:
@@ -1532,6 +1534,15 @@ async def enqueue_document_qa_generation(
             enqueued=False,
             doc_uuid=payload.doc_uuid,
             error="REDIS_STREAM_KEY is not configured",
+        )
+    already_generated = await has_ai_generated_qa_for_document_async(
+        db,
+        doc_uuid=payload.doc_uuid,
+    )
+    if already_generated:
+        raise HTTPException(
+            status_code=409,
+            detail="AI-generated QA already exists for this document",
         )
     try:
         redis_client = await get_redis_client()

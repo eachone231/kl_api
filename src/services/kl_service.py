@@ -4113,6 +4113,70 @@ async def enqueue_document_qa_generation_async(
     )
 
 
+async def has_ai_generated_qa_for_document_async(
+    db,
+    doc_uuid: str,
+) -> bool:
+    import aiomysql
+
+    normalized_doc_uuid = doc_uuid.strip()
+    if not normalized_doc_uuid:
+        return False
+
+    status_columns = await _get_table_columns_async(db, "documents_status")
+    has_status_doc_uuid = "doc_uuid" in status_columns
+    has_status_step = "processing_step" in status_columns
+    status_column_name: str | None = None
+    if "processing_status" in status_columns:
+        status_column_name = "processing_status"
+    elif "status" in status_columns:
+        status_column_name = "status"
+
+    if has_status_doc_uuid and has_status_step and status_column_name:
+        status_qry = f"""
+        SELECT 1
+        FROM documents_status ds
+        WHERE ds.doc_uuid = %(doc_uuid)s
+          AND UPPER(COALESCE(ds.processing_step, '')) = 'QA_GENERATING'
+          AND UPPER(COALESCE(ds.{status_column_name}, '')) = 'SUCCESS'
+        LIMIT 1
+        """
+        async with db.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(status_qry, {"doc_uuid": normalized_doc_uuid})
+            status_row = await cursor.fetchone()
+            if status_row is not None:
+                return True
+
+    doc_qry = """
+    SELECT processing_step
+    FROM documents
+    WHERE doc_uuid = %(doc_uuid)s
+    LIMIT 1
+    """
+    qa_exists_qry = """
+    SELECT 1
+    FROM chunks ch
+    JOIN qa q ON q.chunk_id = ch.id
+    WHERE ch.doc_uuid = %(doc_uuid)s
+      AND LOWER(COALESCE(q.generated_by, '')) = 'ai'
+    LIMIT 1
+    """
+
+    async with db.cursor(aiomysql.DictCursor) as cursor:
+        await cursor.execute(doc_qry, {"doc_uuid": normalized_doc_uuid})
+        doc_row = await cursor.fetchone()
+        if doc_row is None:
+            return False
+
+        processing_step = str(doc_row.get("processing_step") or "").upper()
+        if processing_step not in {"QA_GENERATING", "QA_GENERATED", "COMPLETE"}:
+            return False
+
+        await cursor.execute(qa_exists_qry, {"doc_uuid": normalized_doc_uuid})
+        qa_row = await cursor.fetchone()
+        return qa_row is not None
+
+
 async def enqueue_cabinet_collection_delete_async(
     redis_client,
     cabinet_uuid: str,
