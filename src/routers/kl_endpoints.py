@@ -1694,6 +1694,10 @@ async def upload_documents(
         items = await save_uploaded_documents_async(
             db, cabinet=cabinet, files=files
         )
+        if len(items) != len(files):
+            raise RuntimeError(
+                "Some files were not fully saved; aborting enqueue"
+            )
         # Commit before enqueue so workers can read the document row.
         await db.commit()
     except RuntimeError as exc:
