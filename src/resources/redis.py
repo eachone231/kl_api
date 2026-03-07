@@ -4,6 +4,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from src.config import settings
+from src.resources.crypto_env import decrypt_secret
 
 
 @dataclass(frozen=True)
@@ -220,6 +221,8 @@ def _build_redis_url() -> str | None:
     host = settings.redis_host
     port = settings.redis_port
     password = settings.redis_pwd
+    if isinstance(password, str) and password.startswith("ENC"):
+        password = decrypt_secret(password)
     if not host or not port:
         return None
     auth = ""
