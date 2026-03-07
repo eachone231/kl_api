@@ -1788,7 +1788,10 @@ async def pipeline_status_sse(request: Request):
                         "error": str(exc),
                         "stream": stream,
                     }
-                    yield f"event: error\ndata: {json.dumps(payload)}\n\n"
+                    yield (
+                        "event: error\ndata: "
+                        f"{json.dumps(payload, ensure_ascii=False)}\n\n"
+                    )
                     break
 
                 if not result:
@@ -1812,7 +1815,7 @@ async def pipeline_status_sse(request: Request):
                             "fields": data,
                         }
                         last_id = entry_id
-                        yield f"data: {json.dumps(payload)}\n\n"
+                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
         finally:
             await redis_client.close()
 
