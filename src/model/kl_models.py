@@ -449,6 +449,7 @@ class ChunkListItem(BaseModel):
     chunk_index: int | None = None
     content_preview: str | None = None
     content: str | None = None
+    meta: object | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     chunking_config_id: int | None = None

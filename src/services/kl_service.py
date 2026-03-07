@@ -3488,10 +3488,14 @@ async def fetch_chunks_async(
     from src.model.kl_models import ChunkListItem
 
     chunking_configs_columns = await _get_table_columns_async(db, "chunking_configs")
+    chunks_columns = await _get_table_columns_async(db, "chunks")
     splitter_version_select = (
         "cc.splitter_version AS splitter_version"
         if "splitter_version" in chunking_configs_columns
         else "NULL AS splitter_version"
+    )
+    chunk_meta_select = (
+        "ch.meta AS meta" if "meta" in chunks_columns else "NULL AS meta"
     )
     join_sql = ""
     where_clauses = ["1=1"]
@@ -3529,6 +3533,7 @@ async def fetch_chunks_async(
         ch.chunk_index,
         LEFT(ch.content, %(preview_length)s) AS content_preview,
         ch.content,
+        {chunk_meta_select},
         ch.created_at,
         ch.updated_at,
         d.file_name,
@@ -3566,6 +3571,7 @@ async def fetch_chunks_async(
             chunk_index=row["chunk_index"],
             content_preview=row["content_preview"],
             content=row["content"],
+            meta=row.get("meta"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             chunking_config_id=row["chunking_config_id"],
