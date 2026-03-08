@@ -1920,9 +1920,19 @@ async def delete_cabinet_async(
     cabinet_uuid: str,
 ) -> tuple[bool, str | None]:
     import aiomysql
+    import asyncio
+    from urllib import request as urllib_request
+    from urllib.error import HTTPError, URLError
+
+    from src.config import settings
 
     exists_qry = """
-    SELECT id
+    SELECT
+        id,
+        vector_store,
+        collection_name,
+        storage_base_path,
+        storage_path
     FROM cabinets
     WHERE cabinet_uuid = %(cabinet_uuid)s
     LIMIT 1
@@ -1932,16 +1942,71 @@ async def delete_cabinet_async(
     FROM documents
     WHERE cabinet_uuid = %(cabinet_uuid)s
     """
-    delete_qry = """
-    DELETE FROM cabinets
+    delete_chunking_runs_qry = """
+    DELETE FROM chunking_runs
     WHERE cabinet_uuid = %(cabinet_uuid)s
     """
+    delete_cabinet_qry = "DELETE FROM cabinets WHERE cabinet_uuid = %(cabinet_uuid)s"
     params = {"cabinet_uuid": cabinet_uuid}
+
+    async def _delete_qdrant_collection_async(
+        vector_store: str | None,
+        collection_name: str | None,
+    ) -> tuple[bool, str | None]:
+        normalized_store = str(vector_store or "").strip().lower()
+        normalized_collection = str(collection_name or "").strip()
+        if not normalized_store or not normalized_collection:
+            return True, None
+        if normalized_store != "qdrant":
+            return False, f"unsupported_vector_store:{vector_store}"
+
+        profiles = await fetch_system_vdb_profiles_async(db)
+        profile = profiles.get(settings.env, {})
+        host = str(profile.get("host") or "").rstrip("/")
+        port = str(profile.get("port") or "").strip()
+        token = profile.get("token") or None
+        if isinstance(token, str) and token.startswith("ENC"):
+            from src.resources.crypto_env import decrypt_secret
+
+            token = decrypt_secret(token)
+        if not host:
+            return False, "qdrant_host_missing"
+
+        if host.startswith("http://") or host.startswith("https://"):
+            base_url = host
+        else:
+            base_url = f"http://{host}"
+        if port and ":" not in base_url.rsplit("/", 1)[-1]:
+            base_url = f"{base_url}:{port}"
+        url = f"{base_url}/collections/{normalized_collection}?timeout=30"
+
+        def _delete_request() -> None:
+            headers: dict[str, str] = {}
+            if token:
+                headers["api-key"] = str(token)
+            req = urllib_request.Request(url, headers=headers, method="DELETE")
+            with urllib_request.urlopen(req, timeout=20) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(
+                        f"qdrant_collection_delete_failed:{resp.status}"
+                    )
+
+        try:
+            await asyncio.to_thread(_delete_request)
+        except HTTPError as exc:
+            if exc.code == 404:
+                return True, None
+            return False, f"qdrant_collection_delete_http_{exc.code}"
+        except URLError:
+            return False, "qdrant_connection_failed"
+        except Exception:
+            return False, "qdrant_collection_delete_failed"
+        return True, None
 
     async with db.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute(exists_qry, params)
-        exists = await cursor.fetchone()
-        if exists is None:
+        cabinet_row = await cursor.fetchone()
+        if cabinet_row is None:
             return False, "not_found"
 
         await cursor.execute(documents_qry, params)
@@ -1949,7 +2014,22 @@ async def delete_cabinet_async(
         if int(documents_row.get("document_count") or 0) > 0:
             return False, "has_documents"
 
-        await cursor.execute(delete_qry, params)
+        chunking_run_columns = await _get_table_columns_async(db, "chunking_runs")
+        if chunking_run_columns:
+            if "cabinet_uuid" not in chunking_run_columns:
+                return False, "chunking_runs_missing_cabinet_uuid"
+            await cursor.execute(delete_chunking_runs_qry, params)
+
+        await cursor.execute(delete_cabinet_qry, params)
+        if cursor.rowcount == 0:
+            return False, "not_found"
+
+    ok, reason = await _delete_qdrant_collection_async(
+        vector_store=cabinet_row.get("vector_store"),
+        collection_name=cabinet_row.get("collection_name"),
+    )
+    if not ok:
+        return False, reason
     return True, None
 
 
@@ -3098,27 +3178,58 @@ async def delete_document_async(
         headers = {"Content-Type": "application/json"}
         if token:
             headers["api-key"] = token
-        url = f"{base_url}/collections/{collection}/points/delete"
+        url = f"{base_url}/collections/{collection}/points/delete?wait=true"
         batch_size = 256
         def _send(payload: bytes) -> None:
-            req = urllib_request.Request(url, data=payload, headers=headers)
+            req = urllib_request.Request(
+                url,
+                data=payload,
+                headers=headers,
+                method="POST",
+            )
             with urllib_request.urlopen(req, timeout=10) as resp:
+                body_bytes = resp.read()
                 if resp.status >= 400:
                     raise RuntimeError(f"qdrant delete failed: {resp.status}")
+                if not body_bytes:
+                    return
+                try:
+                    body = json.loads(body_bytes.decode("utf-8"))
+                except Exception:
+                    return
+                if isinstance(body, dict):
+                    status_text = str(body.get("status") or "").lower()
+                    if status_text and status_text != "ok":
+                        raise RuntimeError(
+                            f"qdrant delete failed: response status={status_text}"
+                        )
 
         uuid_pattern = re.compile(
             r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
             r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
         )
 
-        def _is_supported_point_id(value: object) -> bool:
+        def _normalize_point_id(value: object) -> object | None:
             if isinstance(value, int):
-                return True
+                return value
             if isinstance(value, str):
-                return bool(uuid_pattern.match(value.strip()))
-            return False
+                text = value.strip()
+                if not text:
+                    return None
+                if text.isdigit():
+                    return int(text)
+                if uuid_pattern.match(text):
+                    return text
+                # Some deployments store non-UUID string ids in embeddings.vector_id.
+                # Let Qdrant validate these ids instead of dropping them preemptively.
+                return text
+            return None
 
-        valid_ids = [point_id for point_id in ids if _is_supported_point_id(point_id)]
+        valid_ids = []
+        for point_id in ids:
+            normalized = _normalize_point_id(point_id)
+            if normalized is not None:
+                valid_ids.append(normalized)
         invalid_count = len(ids) - len(valid_ids)
         if invalid_count > 0:
             logger.warning(
@@ -3128,13 +3239,13 @@ async def delete_document_async(
                 invalid_count,
             )
 
-        deleted = False
+        deleted_by_ids = False
         for i in range(0, len(valid_ids), batch_size):
             batch_ids = valid_ids[i : i + batch_size]
             legacy_payload = json.dumps({"points": batch_ids}).encode("utf-8")
             try:
                 _send(legacy_payload)
-                deleted = True
+                deleted_by_ids = True
             except HTTPError as exc:
                 body = ""
                 try:
@@ -3154,7 +3265,7 @@ async def delete_document_async(
                 ).encode("utf-8")
                 try:
                     _send(payload)
-                    deleted = True
+                    deleted_by_ids = True
                 except HTTPError as exc2:
                     body2 = ""
                     try:
@@ -3167,99 +3278,46 @@ async def delete_document_async(
                         payload.decode("utf-8", errors="replace"),
                         body2,
                     )
-                    raise
+                    # Keep trying next batch/format. Overall failure is handled below.
+                    if exc2.code != 400:
+                        raise
 
-        if deleted:
+        if deleted_by_ids:
             return
-
-        # Fallback for deployments storing non-Qdrant-native vector_id values
-        # (for example "doc:<uuid>:chunk:<n>"). In that case remove points by payload.
-        filter_candidates = [
-            {
-                "points": {
-                    "filter": {
-                        "must": [
-                            {
-                                "key": "doc_uuid",
-                                "match": {"value": document_uuid},
-                            }
-                        ]
-                    }
-                }
-            },
-            {
-                "filter": {
-                    "must": [
-                        {"key": "doc_uuid", "match": {"value": document_uuid}}
-                    ]
-                }
-            },
-            {
-                "points": {
-                    "filter": {
-                        "must": [
-                            {
-                                "key": "document_uuid",
-                                "match": {"value": document_uuid},
-                            }
-                        ]
-                    }
-                }
-            },
-            {
-                "filter": {
-                    "must": [
-                        {
-                            "key": "document_uuid",
-                            "match": {"value": document_uuid},
-                        }
-                    ]
-                }
-            },
-        ]
-
-        last_error: Exception | None = None
-        for body_obj in filter_candidates:
-            payload = json.dumps(body_obj).encode("utf-8")
-            try:
-                _send(payload)
-                logger.info(
-                    "qdrant delete fallback succeeded: collection=%s doc_uuid=%s payload=%s",
-                    collection,
-                    document_uuid,
-                    json.dumps(body_obj, ensure_ascii=False),
-                )
-                return
-            except HTTPError as exc:
-                last_error = exc
-                body = ""
-                try:
-                    body = exc.read().decode("utf-8")
-                except Exception:
-                    body = "<unreadable>"
-                logger.error(
-                    "qdrant delete fallback 400: url=%s payload=%s body=%s",
-                    url,
-                    payload.decode("utf-8", errors="replace"),
-                    body,
-                )
-            except Exception as exc:
-                last_error = exc
-
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("qdrant delete failed: no valid ids and no filter fallback")
+        if valid_ids:
+            raise RuntimeError("qdrant delete failed for all vector_id values")
+        raise RuntimeError(
+            "qdrant delete failed: no valid vector_id values in embeddings"
+        )
 
     async def _delete_vectors_if_needed() -> bool:
-        if not vector_ids:
-            return True
-        if not vector_store or not collection_name:
+        normalized_store = str(vector_store or "").strip().lower()
+        normalized_collection = str(collection_name or "").strip()
+
+        if not normalized_store or not normalized_collection:
+            if vector_ids:
+                logger.error(
+                    "vector delete failed: missing vector_store/collection_name while embeddings exist store=%s collection=%s vector_count=%s",
+                    vector_store,
+                    collection_name,
+                    len(vector_ids),
+                )
+                return False
             logger.warning(
-                "vector delete skipped: missing vector_store/collection_name"
+                "vector delete skipped: missing vector_store/collection_name store=%s collection=%s",
+                vector_store,
+                collection_name,
             )
             return True
 
-        if str(vector_store).lower() != "qdrant":
+        if normalized_store != "qdrant":
+            if vector_ids:
+                logger.error(
+                    "vector delete failed: unsupported vector_store=%s while embeddings exist count=%s",
+                    vector_store,
+                    len(vector_ids),
+                )
+                return False
             logger.warning(
                 "vector delete skipped: unsupported vector_store=%s",
                 vector_store,
@@ -3278,8 +3336,12 @@ async def delete_document_async(
 
             token = decrypt_secret(token)
         if not host:
-            logger.warning("vector delete skipped: qdrant host missing")
-            return True
+            logger.error(
+                "vector delete failed: qdrant host missing env=%s profile_keys=%s",
+                settings.env,
+                list(profile.keys()) if isinstance(profile, dict) else [],
+            )
+            return False
         if host.startswith("http://") or host.startswith("https://"):
             base_url = host
         else:
@@ -3288,11 +3350,12 @@ async def delete_document_async(
             base_url = f"{base_url}:{port}"
 
         try:
+            # Even if vector_ids is empty, run payload-filter fallback by document UUID.
             await asyncio.to_thread(
                 _delete_qdrant_vectors,
                 base_url,
                 token,
-                str(collection_name),
+                normalized_collection,
                 vector_ids,
                 document_uuid,
             )
@@ -3352,6 +3415,7 @@ async def delete_document_async(
                     base_dir / "html" / f"{doc_uuid}.html",
                     base_dir / "md" / f"{doc_uuid}.md",
                     base_dir / "imgs" / doc_uuid,
+                    base_dir / "tbls" / doc_uuid,
                 ]
             )
         targets.extend(
@@ -3359,6 +3423,7 @@ async def delete_document_async(
                 upload_root / "html" / f"{doc_uuid}.html",
                 upload_root / "md" / f"{doc_uuid}.md",
                 upload_root / "imgs" / doc_uuid,
+                upload_root / "tbls" / doc_uuid,
             ]
         )
         for target in targets:
