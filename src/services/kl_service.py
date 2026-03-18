@@ -3294,6 +3294,15 @@ async def delete_document_async(
         normalized_store = str(vector_store or "").strip().lower()
         normalized_collection = str(collection_name or "").strip()
 
+        if not vector_ids:
+            logger.warning(
+                "vector delete skipped: no vector ids found for doc_uuid=%s store=%s collection=%s",
+                document_uuid,
+                vector_store,
+                collection_name,
+            )
+            return True
+
         if not normalized_store or not normalized_collection:
             if vector_ids:
                 logger.error(
@@ -4179,6 +4188,84 @@ async def enqueue_document_qa_generation_async(
         {
             "type": "qa_generation",
             "doc_uuid": doc_uuid.strip(),
+        },
+        maxlen=redis_client.stream_maxlen,
+    )
+
+
+async def enqueue_chat_async(
+    redis_client,
+    task_id: str,
+    session_id: str,
+    cabinet_uuid: str,
+    question: str,
+    stream: str,
+) -> str:
+    response_stream_prefix = "res:"
+    normalized_task_id = task_id.strip()
+    normalized_session_id = session_id.strip()
+    normalized_cabinet_uuid = cabinet_uuid.strip()
+    normalized_question = question.strip()
+    if not normalized_task_id:
+        raise RuntimeError("task_id is required")
+    if not normalized_session_id:
+        raise RuntimeError("session_id is required")
+    if not normalized_cabinet_uuid:
+        raise RuntimeError("cabinet_uuid is required")
+    if not normalized_question:
+        raise RuntimeError("question is required")
+    return await redis_client.xadd(
+        stream,
+        {
+            "type": "rag-chat",
+            "task_id": normalized_task_id,
+            "response_stream": f"{response_stream_prefix}{normalized_task_id}",
+            "session_id": normalized_session_id,
+            "cabinet_uuid": normalized_cabinet_uuid,
+            "question": normalized_question,
+        },
+        maxlen=redis_client.stream_maxlen,
+    )
+
+
+async def enqueue_rag_test_async(
+    redis_client,
+    task_id: str,
+    session_id: str,
+    cabinet_uuid: str,
+    doc_uuid: str,
+    question: str,
+    stream: str,
+) -> str:
+    response_stream_prefix = "res:"
+    normalized_task_id = task_id.strip()
+    normalized_session_id = session_id.strip()
+    normalized_cabinet_uuid = cabinet_uuid.strip()
+    normalized_doc_uuid = doc_uuid.strip()
+    normalized_question = question.strip()
+    if not normalized_task_id:
+        raise RuntimeError("task_id is required")
+    if not normalized_session_id:
+        raise RuntimeError("session_id is required")
+    if not normalized_cabinet_uuid:
+        raise RuntimeError("cabinet_uuid is required")
+    if not normalized_doc_uuid:
+        raise RuntimeError("doc_uuid is required")
+    if not normalized_question:
+        raise RuntimeError("question is required")
+    from src.config import settings
+
+    return await redis_client.xadd(
+        stream,
+        {
+            "type": "doc-chat",
+            "task_id": normalized_task_id,
+            "response_stream": f"{response_stream_prefix}{normalized_task_id}",
+            "session_id": normalized_session_id,
+            "cabinet_uuid": normalized_cabinet_uuid,
+            "doc_uuid": normalized_doc_uuid,
+            "question": normalized_question,
+            "top_k": settings.rag_chat_top_k,
         },
         maxlen=redis_client.stream_maxlen,
     )

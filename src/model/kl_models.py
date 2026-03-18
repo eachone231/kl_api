@@ -432,6 +432,46 @@ class DocumentQAGenerationResponse(BaseModel):
     error: str | None = None
 
 
+class ChatRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    cabinet_uuid: str = Field(..., min_length=1)
+    question: str = Field(..., min_length=1)
+
+
+class ChatResponse(BaseModel):
+    enqueued: bool
+    session_id: str
+    cabinet_uuid: str
+    question: str
+    task_id: str | None = None
+    error: str | None = None
+
+
+class ChatSSERequest(BaseModel):
+    task_id: str = Field(..., min_length=1)
+
+
+class RagTestRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    cabinet_uuid: str = Field(..., min_length=1)
+    doc_uuid: str = Field(..., min_length=1)
+    question: str = Field(..., min_length=1)
+
+
+class RagTestResponse(BaseModel):
+    enqueued: bool
+    session_id: str
+    cabinet_uuid: str
+    doc_uuid: str
+    question: str
+    task_id: str | None = None
+    error: str | None = None
+
+
+class RagTestSSERequest(BaseModel):
+    task_id: str = Field(..., min_length=1)
+
+
 class DocumentDeleteRequest(BaseModel):
     document_uuid: str
 

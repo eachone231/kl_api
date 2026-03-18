@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     redis_stream_maxlen: int | None = Field(
         None, validation_alias="REDIS_STREAM_MAXLEN"
     )
+    rag_chat_top_k: int = Field(5, validation_alias="RAG_CHAT_TOP_K")
     jwt_secret_key: str = Field("change-me", validation_alias="JWT_SECRET_KEY")
     jwt_algorithm: str = Field("HS256", validation_alias="JWT_ALGORITHM")
     jwt_expire_min: int = Field(60, validation_alias="JWT_EXPIRE_MIN")
@@ -90,6 +91,13 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def get_jwt_secret_key() -> str:
+    secret = settings.jwt_secret_key
+    if isinstance(secret, str) and secret.startswith("ENC"):
+        return decrypt_secret(secret)
+    return secret
 
 
 def build_mysql_aiomysql_config() -> dict[str, object]:

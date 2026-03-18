@@ -12,6 +12,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, StreamingResponse
 from pathlib import Path
 from datetime import datetime, timezone
+from uuid import uuid4
 import aiomysql
 import json
 import tempfile
@@ -35,6 +36,12 @@ from src.model.kl_models import (
     QAEvaluationCreateResponse,
     DocumentQAGenerationRequest,
     DocumentQAGenerationResponse,
+    ChatRequest,
+    ChatResponse,
+    ChatSSERequest,
+    RagTestRequest,
+    RagTestResponse,
+    RagTestSSERequest,
     DocumentSummaryResponse,
     DocumentsResponse,
     ChunksResponse,
@@ -159,6 +166,8 @@ from src.services.kl_service import (
     fetch_enqueries_async,
     has_ai_generated_qa_for_document_async,
     enqueue_document_qa_generation_async,
+    enqueue_chat_async,
+    enqueue_rag_test_async,
     enqueue_document_pipeline_async,
 )
 from src.resources.crypto_env import encrypt_secret
@@ -197,6 +206,36 @@ def _write_resource_json(filename: str, data):
         temp_path.replace(path)
     except OSError:
         raise HTTPException(status_code=500, detail="Failed to write resource")
+
+
+def _stream_fields_to_dict(fields) -> dict[str, object]:
+    data: dict[str, object] = {}
+    if isinstance(fields, dict):
+        for key, value in fields.items():
+            data[str(key)] = value
+        return data
+    if isinstance(fields, list):
+        it = iter(fields)
+        for key in it:
+            try:
+                value = next(it)
+            except StopIteration:
+                value = ""
+            data[str(key)] = value
+    return data
+
+
+def _build_chat_result_stream(task_id: str) -> str:
+    return f"res:{task_id.strip()}"
+
+
+def _chat_status_is_terminal(data: dict[str, object]) -> bool:
+    terminal_values = {"done", "complete", "completed", "success", "failed", "error"}
+    for key in ("status", "state", "event", "result"):
+        value = str(data.get(key) or "").strip().lower()
+        if value in terminal_values:
+            return True
+    return False
 
 
 @api_router.get("/")
@@ -1517,6 +1556,266 @@ async def enqueue_document_qa_generation(
         enqueued=True,
         doc_uuid=payload.doc_uuid,
         stream_entry_id=entry_id,
+    )
+
+
+@api_router.post(
+    "/api/cabinet/rag-chat",
+    tags=["chat"],
+    response_model=ChatResponse,
+)
+async def enqueue_chat(
+    payload: ChatRequest,
+):
+    stream = settings.redis_stream_key or settings.redis_stream
+    if not stream:
+        return ChatResponse(
+            enqueued=False,
+            session_id=payload.session_id,
+            cabinet_uuid=payload.cabinet_uuid,
+            question=payload.question,
+            error="REDIS_STREAM_KEY is not configured",
+        )
+    try:
+        redis_client = await get_redis_client()
+        task_id = str(uuid4())
+        await enqueue_chat_async(
+            redis_client=redis_client,
+            task_id=task_id,
+            session_id=payload.session_id,
+            cabinet_uuid=payload.cabinet_uuid,
+            question=payload.question,
+            stream=stream,
+        )
+    except Exception as exc:
+        return ChatResponse(
+            enqueued=False,
+            session_id=payload.session_id,
+            cabinet_uuid=payload.cabinet_uuid,
+            question=payload.question,
+            error=str(exc),
+        )
+    return ChatResponse(
+        enqueued=True,
+        session_id=payload.session_id,
+        cabinet_uuid=payload.cabinet_uuid,
+        question=payload.question,
+        task_id=task_id,
+    )
+
+
+@api_router.post(
+    "/api/cabinet/rag-chat/sse",
+    tags=["chat"],
+)
+async def enqueue_chat_sse(
+    payload: ChatSSERequest,
+    request: Request,
+):
+    result_stream = _build_chat_result_stream(payload.task_id)
+
+    async def event_stream():
+        yield (
+            "event: subscribed\n"
+            f"data: {json.dumps({'task_id': payload.task_id, 'stream': result_stream}, ensure_ascii=False)}\n\n"
+        )
+
+        try:
+            status_client = build_redis_client()
+            await status_client.connect()
+        except RuntimeError as exc:
+            yield (
+                "event: error\n"
+                f"data: {json.dumps({'error': str(exc), 'stream': result_stream}, ensure_ascii=False)}\n\n"
+            )
+            return
+
+        last_id = "0-0"
+        keepalive_every_ms = 30000
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    result = await status_client.xread(
+                        stream=result_stream,
+                        last_id=last_id,
+                        block_ms=keepalive_every_ms,
+                        count=100,
+                    )
+                except Exception as exc:
+                    yield (
+                        "event: error\n"
+                        f"data: {json.dumps({'error': str(exc), 'stream': result_stream}, ensure_ascii=False)}\n\n"
+                    )
+                    break
+
+                if not result:
+                    yield ": keep-alive\n\n"
+                    continue
+
+                for stream_name, entries in result:
+                    for status_entry_id, fields in entries:
+                        last_id = status_entry_id
+                        data = _stream_fields_to_dict(fields)
+
+                        event_payload = {
+                            "stream": stream_name,
+                            "id": status_entry_id,
+                            "fields": data,
+                        }
+                        yield (
+                            "event: message\n"
+                            f"data: {json.dumps(event_payload, ensure_ascii=False)}\n\n"
+                        )
+                        if _chat_status_is_terminal(data):
+                            yield (
+                                "event: done\n"
+                                f"data: {json.dumps(event_payload, ensure_ascii=False)}\n\n"
+                            )
+                            return
+        finally:
+            await status_client.close()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@api_router.post(
+    "/api/document/doc-chat",
+    tags=["chat"],
+    response_model=RagTestResponse,
+)
+async def enqueue_rag_test(
+    payload: RagTestRequest,
+):
+    stream = settings.redis_stream_key or settings.redis_stream
+    if not stream:
+        return RagTestResponse(
+            enqueued=False,
+            session_id=payload.session_id,
+            cabinet_uuid=payload.cabinet_uuid,
+            doc_uuid=payload.doc_uuid,
+            question=payload.question,
+            error="REDIS_STREAM_KEY is not configured",
+        )
+    try:
+        redis_client = await get_redis_client()
+        task_id = str(uuid4())
+        await enqueue_rag_test_async(
+            redis_client=redis_client,
+            task_id=task_id,
+            session_id=payload.session_id,
+            cabinet_uuid=payload.cabinet_uuid,
+            doc_uuid=payload.doc_uuid,
+            question=payload.question,
+            stream=stream,
+        )
+    except Exception as exc:
+        return RagTestResponse(
+            enqueued=False,
+            session_id=payload.session_id,
+            cabinet_uuid=payload.cabinet_uuid,
+            doc_uuid=payload.doc_uuid,
+            question=payload.question,
+            error=str(exc),
+        )
+    return RagTestResponse(
+        enqueued=True,
+        session_id=payload.session_id,
+        cabinet_uuid=payload.cabinet_uuid,
+        doc_uuid=payload.doc_uuid,
+        question=payload.question,
+        task_id=task_id,
+    )
+
+
+@api_router.post(
+    "/api/document/doc-chat/sse",
+    tags=["chat"],
+)
+async def enqueue_rag_test_sse(
+    payload: RagTestSSERequest,
+    request: Request,
+):
+    result_stream = _build_chat_result_stream(payload.task_id)
+
+    async def event_stream():
+        yield (
+            "event: subscribed\n"
+            f"data: {json.dumps({'task_id': payload.task_id, 'stream': result_stream}, ensure_ascii=False)}\n\n"
+        )
+
+        try:
+            status_client = build_redis_client()
+            await status_client.connect()
+        except RuntimeError as exc:
+            yield (
+                "event: error\n"
+                f"data: {json.dumps({'error': str(exc), 'stream': result_stream}, ensure_ascii=False)}\n\n"
+            )
+            return
+
+        last_id = "0-0"
+        keepalive_every_ms = 30000
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    result = await status_client.xread(
+                        stream=result_stream,
+                        last_id=last_id,
+                        block_ms=keepalive_every_ms,
+                        count=100,
+                    )
+                except Exception as exc:
+                    yield (
+                        "event: error\n"
+                        f"data: {json.dumps({'error': str(exc), 'stream': result_stream}, ensure_ascii=False)}\n\n"
+                    )
+                    break
+
+                if not result:
+                    yield ": keep-alive\n\n"
+                    continue
+
+                for stream_name, entries in result:
+                    for status_entry_id, fields in entries:
+                        last_id = status_entry_id
+                        data = _stream_fields_to_dict(fields)
+
+                        event_payload = {
+                            "stream": stream_name,
+                            "id": status_entry_id,
+                            "fields": data,
+                        }
+                        yield (
+                            "event: message\n"
+                            f"data: {json.dumps(event_payload, ensure_ascii=False)}\n\n"
+                        )
+                        if _chat_status_is_terminal(data):
+                            yield (
+                                "event: done\n"
+                                f"data: {json.dumps(event_payload, ensure_ascii=False)}\n\n"
+                            )
+                            return
+        finally:
+            await status_client.close()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
     )
 
 

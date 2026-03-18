@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import jwt
 from fastapi import HTTPException
 
-from src.config import settings
+from src.config import get_jwt_secret_key, settings
 
 
 def create_access_token(*, emp_id: str, email: str) -> str:
@@ -17,7 +17,7 @@ def create_access_token(*, emp_id: str, email: str) -> str:
     }
     return jwt.encode(
         payload,
-        settings.jwt_secret_key,
+        get_jwt_secret_key(),
         algorithm=settings.jwt_algorithm,
     )
 
@@ -26,7 +26,7 @@ def verify_access_token(token: str) -> dict[str, object]:
     try:
         decoded = jwt.decode(
             token,
-            settings.jwt_secret_key,
+            get_jwt_secret_key(),
             algorithms=[settings.jwt_algorithm],
         )
     except jwt.PyJWTError as exc:
