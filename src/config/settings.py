@@ -51,10 +51,10 @@ class Settings(BaseSettings):
     redis_queue: str = Field("document_pipeline", validation_alias="REDIS_QUEUE")
     redis_stream: str = Field("document_pipeline", validation_alias="REDIS_STREAM")
     redis_pipeline_status_stream: str | None = Field(
-        None, validation_alias="REDIS_PIPELINE_STATUS_STREAM"
+        None, validation_alias="KL_WORKER_REDIS_TASK_STATUS_STREAM"
     )
-    # Backward-compat for deployments using REDIS_STREAM_KEY.
-    redis_stream_key: str | None = Field(None, validation_alias="REDIS_STREAM_KEY")
+    # Backward-compat for deployments using KL_WORKER_REDIS_STREAM.
+    redis_stream_key: str | None = Field(None, validation_alias="KL_WORKER_REDIS_STREAM")
     redis_stream_maxlen: int | None = Field(
         None, validation_alias="REDIS_STREAM_MAXLEN"
     )

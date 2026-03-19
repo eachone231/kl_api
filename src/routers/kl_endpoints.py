@@ -1528,7 +1528,7 @@ async def enqueue_document_qa_generation(
         return DocumentQAGenerationResponse(
             enqueued=False,
             doc_uuid=payload.doc_uuid,
-            error="REDIS_STREAM_KEY is not configured",
+            error="KL_WORKER_REDIS_STREAM is not configured",
         )
     already_generated = await has_ai_generated_qa_for_document_async(
         db,
@@ -1574,7 +1574,7 @@ async def enqueue_chat(
             session_id=payload.session_id,
             cabinet_uuid=payload.cabinet_uuid,
             question=payload.question,
-            error="REDIS_STREAM_KEY is not configured",
+            error="KL_WORKER_REDIS_STREAM is not configured",
         )
     try:
         redis_client = await get_redis_client()
@@ -1703,7 +1703,7 @@ async def enqueue_rag_test(
             cabinet_uuid=payload.cabinet_uuid,
             doc_uuid=payload.doc_uuid,
             question=payload.question,
-            error="REDIS_STREAM_KEY is not configured",
+            error="KL_WORKER_REDIS_STREAM is not configured",
         )
     try:
         redis_client = await get_redis_client()
@@ -2017,7 +2017,7 @@ async def pipeline_status_sse(request: Request):
     if not stream:
         raise HTTPException(
             status_code=500,
-            detail="REDIS_PIPELINE_STATUS_STREAM is not configured",
+            detail="KL_WORKER_REDIS_TASK_STATUS_STREAM is not configured",
         )
     try:
         redis_client = build_redis_client()
