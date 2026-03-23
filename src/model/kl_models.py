@@ -451,6 +451,16 @@ class ChatSSERequest(BaseModel):
     task_id: str = Field(..., min_length=1)
 
 
+class ChatCancelRequest(BaseModel):
+    task_id: str = Field(..., min_length=1)
+
+
+class ChatCancelResponse(BaseModel):
+    enqueued: bool
+    task_id: str
+    error: str | None = None
+
+
 class RagTestRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     cabinet_uuid: str = Field(..., min_length=1)

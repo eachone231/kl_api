@@ -39,6 +39,8 @@ from src.model.kl_models import (
     ChatRequest,
     ChatResponse,
     ChatSSERequest,
+    ChatCancelRequest,
+    ChatCancelResponse,
     RagTestRequest,
     RagTestResponse,
     RagTestSSERequest,
@@ -167,6 +169,7 @@ from src.services.kl_service import (
     has_ai_generated_qa_for_document_async,
     enqueue_document_qa_generation_async,
     enqueue_chat_async,
+    enqueue_chat_cancel_async,
     enqueue_rag_test_async,
     enqueue_document_pipeline_async,
 )
@@ -1684,6 +1687,40 @@ async def enqueue_chat_sse(
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
         },
+    )
+
+
+@api_router.post(
+    "/api/chat/cancel",
+    tags=["chat"],
+    response_model=ChatCancelResponse,
+)
+async def enqueue_chat_cancel(
+    payload: ChatCancelRequest,
+):
+    stream = settings.redis_stream_key or settings.redis_stream
+    if not stream:
+        return ChatCancelResponse(
+            enqueued=False,
+            task_id=payload.task_id,
+            error="KL_WORKER_REDIS_STREAM is not configured",
+        )
+    try:
+        redis_client = await get_redis_client()
+        await enqueue_chat_cancel_async(
+            redis_client=redis_client,
+            task_id=payload.task_id,
+            stream=stream,
+        )
+    except Exception as exc:
+        return ChatCancelResponse(
+            enqueued=False,
+            task_id=payload.task_id,
+            error=str(exc),
+        )
+    return ChatCancelResponse(
+        enqueued=True,
+        task_id=payload.task_id,
     )
 
 

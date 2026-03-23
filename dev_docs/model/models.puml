@@ -1,0 +1,90 @@
+@startuml
+
+entity "models" as models {
+  *id : bigint unsigned <<PK>>
+  --
+  model_type : enum('LLM','EMBEDDING')
+  provider : varchar(50)
+  model_name : varchar(100)
+  model_version : varchar(50)
+  dimension : int
+  is_deprecated : tinyint(1)
+  created_at : datetime
+}
+
+entity "embedding_model_configs" as embedding_model_configs {
+  *id : bigint unsigned <<PK>>
+  --
+  model_id : bigint unsigned <<FK>>
+  chunk_size : int
+  overlap : int
+  normalize : tinyint(1)
+  distance_metric : enum('cosine','l2','dot')
+  extra_params : json
+  created_at : datetime
+}
+
+entity "llm_model_configs" as llm_model_configs {
+  *id : bigint unsigned <<PK>>
+  --
+  model_id : bigint unsigned <<FK>>
+  temperature : float
+  max_tokens : int
+  top_p : float
+  system_prompt : text
+  extra_params : json
+  created_at : datetime
+}
+
+entity "embedding_runs" as embedding_runs {
+  *id : bigint unsigned <<PK>>
+  --
+  document_id : bigint unsigned
+  embedding_model_config_id : bigint unsigned <<FK>>
+  vector_store : varchar(50)
+  status : enum('PENDING','DONE','FAILED')
+  created_at : datetime
+}
+
+entity "system_profiles" as system_profiles {
+  *id : bigint unsigned <<PK>>
+  --
+  name : varchar(50)
+  description : varchar(255)
+  llm_model_config_id : bigint unsigned <<FK>>
+  embedding_model_config_id : bigint unsigned <<FK>>
+  is_active : tinyint(1)
+  created_at : datetime
+}
+
+models::id ||--o{ embedding_model_configs::model_id : fk_embedding_model_configs__models
+models::id ||--o{ llm_model_configs::model_id : fk_llm_model_configs__models
+embedding_model_configs::id ||--o{ embedding_runs::embedding_model_config_id : fk_embedding_runs__embedding_model_configs
+llm_model_configs::id ||--o{ system_profiles::llm_model_config_id : fk_system_profiles__llm
+embedding_model_configs::id ||--o{ system_profiles::embedding_model_config_id : fk_system_profiles__embedding
+
+note right of models
+  COMMENT: 모델 메타 정보 사전 (LLM / Embedding 공통)
+  UNIQUE: uk_model_unique (model_type, provider, model_name, model_version)
+  INDEX: idx_models_type (model_type)
+end note
+
+note right of embedding_model_configs
+  COMMENT: 임베딩 모델 실행 및 청킹 관련 설정
+end note
+
+note right of llm_model_configs
+  COMMENT: LLM 모델 실행 파라미터 설정 테이블
+end note
+
+note right of embedding_runs
+  COMMENT: 임베딩 생성 실행 이력 추적
+  INDEX: idx_embedding_runs_document (document_id)
+end note
+
+note right of system_profiles
+  COMMENT: 시스템 단위 모델 조합 (LLM + Embedding)
+  INDEX: idx_system_profiles_active (is_active)
+end note
+
+@enduml

@@ -4271,6 +4271,24 @@ async def enqueue_rag_test_async(
     )
 
 
+async def enqueue_chat_cancel_async(
+    redis_client,
+    task_id: str,
+    stream: str,
+) -> str:
+    normalized_task_id = task_id.strip()
+    if not normalized_task_id:
+        raise RuntimeError("task_id is required")
+    return await redis_client.xadd(
+        stream,
+        {
+            "type": "chat-cancel",
+            "task_id": normalized_task_id,
+        },
+        maxlen=redis_client.stream_maxlen,
+    )
+
+
 async def has_ai_generated_qa_for_document_async(
     db,
     doc_uuid: str,
