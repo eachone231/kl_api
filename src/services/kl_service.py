@@ -1,9 +1,19 @@
+from src.config import WorkerMessageType, worker_stream_router
+
+
 def say_hello(name: str) -> str:
     return f"Hello {name}"
 
 
 def health_status() -> dict:
     return {"status": "ok"}
+
+
+def _resolve_worker_stream(message_type: str) -> str:
+    route = worker_stream_router.route_for_type(message_type)
+    if not route.stream_name:
+        raise RuntimeError(f"{route.env_var} is not configured")
+    return route.stream_name
 
 
 def _parse_profile_json(value: object) -> dict[str, object]:
@@ -4142,11 +4152,12 @@ async def enqueue_document_pipeline_async(
     logger = logging.getLogger(__name__)
     if not items:
         return 0
+    stream = _resolve_worker_stream(WorkerMessageType.INGESTION)
 
     enqueued = 0
     for item in items:
         fields = {
-            "type": "ingestion",
+            "type": WorkerMessageType.INGESTION,
             "doc_uuid": item.document_uuid,
             "cabinet_uuid": cabinet_uuid,
             "file_name": item.file_name or "",
@@ -4161,13 +4172,13 @@ async def enqueue_document_pipeline_async(
         if item.chunking_run_id is not None:
             fields["chunking_run_id"] = str(item.chunking_run_id)
         await redis_client.xadd(
-            redis_client.stream,
+            stream,
             fields,
             maxlen=redis_client.stream_maxlen,
         )
         logger.info(
             "redis stream enqueue: stream=%s type=%s doc_uuid=%s cabinet_uuid=%s",
-            redis_client.stream,
+            stream,
             fields.get("type"),
             item.document_uuid,
             cabinet_uuid,
@@ -4179,14 +4190,14 @@ async def enqueue_document_pipeline_async(
 async def enqueue_document_qa_generation_async(
     redis_client,
     doc_uuid: str,
-    stream: str,
 ) -> str:
     if not doc_uuid.strip():
         raise RuntimeError("doc_uuid is required")
+    stream = _resolve_worker_stream(WorkerMessageType.QA_GENERATION)
     return await redis_client.xadd(
         stream,
         {
-            "type": "qa_generation",
+            "type": WorkerMessageType.QA_GENERATION,
             "doc_uuid": doc_uuid.strip(),
         },
         maxlen=redis_client.stream_maxlen,
@@ -4199,9 +4210,9 @@ async def enqueue_chat_async(
     session_id: str,
     cabinet_uuid: str,
     question: str,
-    stream: str,
 ) -> str:
     response_stream_prefix = "res:"
+    stream = _resolve_worker_stream(WorkerMessageType.RAG_CHAT)
     normalized_task_id = task_id.strip()
     normalized_session_id = session_id.strip()
     normalized_cabinet_uuid = cabinet_uuid.strip()
@@ -4217,7 +4228,7 @@ async def enqueue_chat_async(
     return await redis_client.xadd(
         stream,
         {
-            "type": "rag-chat",
+            "type": WorkerMessageType.RAG_CHAT,
             "task_id": normalized_task_id,
             "response_stream": f"{response_stream_prefix}{normalized_task_id}",
             "session_id": normalized_session_id,
@@ -4235,9 +4246,9 @@ async def enqueue_rag_test_async(
     cabinet_uuid: str,
     doc_uuid: str,
     question: str,
-    stream: str,
 ) -> str:
     response_stream_prefix = "res:"
+    stream = _resolve_worker_stream(WorkerMessageType.DOC_CHAT)
     normalized_task_id = task_id.strip()
     normalized_session_id = session_id.strip()
     normalized_cabinet_uuid = cabinet_uuid.strip()
@@ -4258,7 +4269,7 @@ async def enqueue_rag_test_async(
     return await redis_client.xadd(
         stream,
         {
-            "type": "doc-chat",
+            "type": WorkerMessageType.DOC_CHAT,
             "task_id": normalized_task_id,
             "response_stream": f"{response_stream_prefix}{normalized_task_id}",
             "session_id": normalized_session_id,
@@ -4274,15 +4285,15 @@ async def enqueue_rag_test_async(
 async def enqueue_chat_cancel_async(
     redis_client,
     task_id: str,
-    stream: str,
 ) -> str:
+    stream = _resolve_worker_stream(WorkerMessageType.CHAT_CANCEL)
     normalized_task_id = task_id.strip()
     if not normalized_task_id:
         raise RuntimeError("task_id is required")
     return await redis_client.xadd(
         stream,
         {
-            "type": "chat-cancel",
+            "type": WorkerMessageType.CHAT_CANCEL,
             "task_id": normalized_task_id,
         },
         maxlen=redis_client.stream_maxlen,
@@ -4376,11 +4387,12 @@ async def enqueue_cabinet_collection_delete_async(
             collection_name,
         )
         return None
+    stream = _resolve_worker_stream(WorkerMessageType.CABINET_COLLECTION_DELETE)
 
     entry_id = await redis_client.xadd(
-        redis_client.stream,
+        stream,
         {
-            "type": "cabinet_collection_delete",
+            "type": WorkerMessageType.CABINET_COLLECTION_DELETE,
             "cabinet_uuid": cabinet_uuid.strip(),
             "vector_store": normalized_store,
             "collection_name": normalized_collection,
@@ -4389,7 +4401,7 @@ async def enqueue_cabinet_collection_delete_async(
     )
     logger.info(
         "redis stream enqueue: stream=%s type=%s cabinet_uuid=%s collection_name=%s",
-        redis_client.stream,
+        stream,
         "cabinet_collection_delete",
         cabinet_uuid,
         normalized_collection,

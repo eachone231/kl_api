@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -50,6 +51,12 @@ class Settings(BaseSettings):
     redis_pwd: str | None = Field(None, validation_alias="REDIS_PWD")
     redis_queue: str = Field("document_pipeline", validation_alias="REDIS_QUEUE")
     redis_stream: str = Field("document_pipeline", validation_alias="REDIS_STREAM")
+    worker_batch_stream: str | None = Field(
+        None, validation_alias="KL_WORKER_BATCH_STREAM"
+    )
+    worker_chat_stream: str | None = Field(
+        None, validation_alias="KL_WORKER_CHAT_STREAM"
+    )
     redis_pipeline_status_stream: str | None = Field(
         None, validation_alias="KL_WORKER_REDIS_TASK_STATUS_STREAM"
     )
@@ -84,13 +91,84 @@ class Settings(BaseSettings):
         return [item.strip() for item in raw.split(",") if item.strip()]
 
     def model_post_init(self, __context) -> None:
+        legacy_stream = self.redis_stream_key or self.redis_stream
+        if not self.worker_batch_stream:
+            self.worker_batch_stream = legacy_stream
+        if not self.worker_chat_stream:
+            self.worker_chat_stream = legacy_stream
         # If REDIS_STREAM_KEY is provided and REDIS_STREAM is left at default,
         # prefer the key for stream name to avoid misconfiguration.
         if self.redis_stream_key and self.redis_stream == "document_pipeline":
             self.redis_stream = self.redis_stream_key
 
 
+class WorkerMessageType:
+    INGESTION = "ingestion"
+    QA_GENERATION = "qa_generation"
+    RAG_CHAT = "rag-chat"
+    DOC_CHAT = "doc-chat"
+    CHAT_CANCEL = "chat-cancel"
+    CABINET_COLLECTION_DELETE = "cabinet_collection_delete"
+
+
+@dataclass(frozen=True)
+class WorkerStreamRoute:
+    route_name: str
+    env_var: str
+    stream_name: str | None
+    message_types: frozenset[str]
+
+
+class WorkerStreamRouter:
+    def __init__(self, app_settings: "Settings"):
+        self._routes = (
+            WorkerStreamRoute(
+                route_name="batch",
+                env_var="KL_WORKER_BATCH_STREAM",
+                stream_name=app_settings.worker_batch_stream,
+                message_types=frozenset(
+                    {
+                        WorkerMessageType.INGESTION,
+                        WorkerMessageType.QA_GENERATION,
+                        WorkerMessageType.CABINET_COLLECTION_DELETE,
+                    }
+                ),
+            ),
+            WorkerStreamRoute(
+                route_name="chat",
+                env_var="KL_WORKER_CHAT_STREAM",
+                stream_name=app_settings.worker_chat_stream,
+                message_types=frozenset(
+                    {
+                        WorkerMessageType.DOC_CHAT,
+                        WorkerMessageType.RAG_CHAT,
+                        WorkerMessageType.CHAT_CANCEL,
+                    }
+                ),
+            ),
+        )
+        self._routes_by_message_type = {
+            message_type: route
+            for route in self._routes
+            for message_type in route.message_types
+        }
+
+    @property
+    def routes(self) -> tuple[WorkerStreamRoute, ...]:
+        return self._routes
+
+    def route_for_type(self, message_type: str) -> WorkerStreamRoute:
+        route = self._routes_by_message_type.get(message_type)
+        if route is None:
+            raise KeyError(f"Unsupported worker message type: {message_type}")
+        return route
+
+    def stream_for_type(self, message_type: str) -> str | None:
+        return self.route_for_type(message_type).stream_name
+
+
 settings = Settings()
+worker_stream_router = WorkerStreamRouter(settings)
 
 
 def get_jwt_secret_key() -> str:

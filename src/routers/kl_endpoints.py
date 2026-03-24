@@ -176,7 +176,7 @@ from src.services.kl_service import (
 from src.resources.crypto_env import encrypt_secret
 from src.resources.auth import create_access_token
 from src.resources.redis import build_redis_client, get_redis_client
-from src.config import settings
+from src.config import WorkerMessageType, settings, worker_stream_router
 
 api_router = APIRouter()
 _RESOURCE_DIR = Path(__file__).resolve().parents[1] / "resources"
@@ -1526,12 +1526,12 @@ async def enqueue_document_qa_generation(
     payload: DocumentQAGenerationRequest,
     db: aiomysql.Connection = Depends(async_get_db),
 ):
-    stream = settings.redis_stream_key or settings.redis_stream
-    if not stream:
+    route = worker_stream_router.route_for_type(WorkerMessageType.QA_GENERATION)
+    if not route.stream_name:
         return DocumentQAGenerationResponse(
             enqueued=False,
             doc_uuid=payload.doc_uuid,
-            error="KL_WORKER_REDIS_STREAM is not configured",
+            error=f"{route.env_var} is not configured",
         )
     already_generated = await has_ai_generated_qa_for_document_async(
         db,
@@ -1547,7 +1547,6 @@ async def enqueue_document_qa_generation(
         entry_id = await enqueue_document_qa_generation_async(
             redis_client=redis_client,
             doc_uuid=payload.doc_uuid,
-            stream=stream,
         )
     except Exception as exc:
         return DocumentQAGenerationResponse(
@@ -1570,14 +1569,14 @@ async def enqueue_document_qa_generation(
 async def enqueue_chat(
     payload: ChatRequest,
 ):
-    stream = settings.redis_stream_key or settings.redis_stream
-    if not stream:
+    route = worker_stream_router.route_for_type(WorkerMessageType.RAG_CHAT)
+    if not route.stream_name:
         return ChatResponse(
             enqueued=False,
             session_id=payload.session_id,
             cabinet_uuid=payload.cabinet_uuid,
             question=payload.question,
-            error="KL_WORKER_REDIS_STREAM is not configured",
+            error=f"{route.env_var} is not configured",
         )
     try:
         redis_client = await get_redis_client()
@@ -1588,7 +1587,6 @@ async def enqueue_chat(
             session_id=payload.session_id,
             cabinet_uuid=payload.cabinet_uuid,
             question=payload.question,
-            stream=stream,
         )
     except Exception as exc:
         return ChatResponse(
@@ -1698,19 +1696,18 @@ async def enqueue_chat_sse(
 async def enqueue_chat_cancel(
     payload: ChatCancelRequest,
 ):
-    stream = settings.redis_stream_key or settings.redis_stream
-    if not stream:
+    route = worker_stream_router.route_for_type(WorkerMessageType.CHAT_CANCEL)
+    if not route.stream_name:
         return ChatCancelResponse(
             enqueued=False,
             task_id=payload.task_id,
-            error="KL_WORKER_REDIS_STREAM is not configured",
+            error=f"{route.env_var} is not configured",
         )
     try:
         redis_client = await get_redis_client()
         await enqueue_chat_cancel_async(
             redis_client=redis_client,
             task_id=payload.task_id,
-            stream=stream,
         )
     except Exception as exc:
         return ChatCancelResponse(
@@ -1732,15 +1729,15 @@ async def enqueue_chat_cancel(
 async def enqueue_rag_test(
     payload: RagTestRequest,
 ):
-    stream = settings.redis_stream_key or settings.redis_stream
-    if not stream:
+    route = worker_stream_router.route_for_type(WorkerMessageType.DOC_CHAT)
+    if not route.stream_name:
         return RagTestResponse(
             enqueued=False,
             session_id=payload.session_id,
             cabinet_uuid=payload.cabinet_uuid,
             doc_uuid=payload.doc_uuid,
             question=payload.question,
-            error="KL_WORKER_REDIS_STREAM is not configured",
+            error=f"{route.env_var} is not configured",
         )
     try:
         redis_client = await get_redis_client()
@@ -1752,7 +1749,6 @@ async def enqueue_rag_test(
             cabinet_uuid=payload.cabinet_uuid,
             doc_uuid=payload.doc_uuid,
             question=payload.question,
-            stream=stream,
         )
     except Exception as exc:
         return RagTestResponse(
