@@ -70,6 +70,19 @@ class Settings(BaseSettings):
     jwt_algorithm: str = Field("HS256", validation_alias="JWT_ALGORITHM")
     jwt_expire_min: int = Field(60, validation_alias="JWT_EXPIRE_MIN")
     auth_enabled: bool = Field(True, validation_alias="AUTH_ENABLED")
+    storage_provider: str = Field("minio", validation_alias="STORAGE_PROVIDER")
+    storage_endpoint: str = Field("", validation_alias="STORAGE_ENDPOINT")
+    storage_use_ssl: bool = Field(False, validation_alias="STORAGE_USE_SSL")
+    storage_path_style: bool = Field(True, validation_alias="STORAGE_PATH_STYLE")
+    storage_region: str | None = Field(None, validation_alias="STORAGE_REGION")
+    storage_bucket_name: str = Field("", validation_alias="STORAGE_BUCKET_NAME")
+    storage_base_prefix: str = Field("", validation_alias="STORAGE_BASE_PREFIX")
+    storage_access_key: str | None = Field(
+        None, validation_alias="STORAGE_ACCESS_KEY"
+    )
+    storage_secret_key: str | None = Field(
+        None, validation_alias="STORAGE_SECRET_KEY"
+    )
 
     @field_validator("cors_origins", mode="before")
     @classmethod

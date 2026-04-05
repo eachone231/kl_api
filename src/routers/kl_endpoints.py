@@ -9,10 +9,11 @@ from fastapi import (
     Request,
 )
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pathlib import Path
 from datetime import datetime, timezone
 from uuid import uuid4
+import logging
 import aiomysql
 import json
 import tempfile
@@ -21,6 +22,8 @@ from src.resources.mysql import async_get_db
 from src.model.kl_models import (
     CabinetsResponse,
     CabinetResponse,
+    CabinetStorageProfileResponse,
+    CabinetItemResponse,
     CabinetDeleteRequest,
     CabinetDeleteResponse,
     CabinetChunkingRunRequest,
@@ -130,7 +133,6 @@ from src.services.kl_service import (
     create_project_async,
     update_project_async,
     delete_project_async,
-    fetch_storage_types_async,
     fetch_vector_stores_async,
     fetch_system_secret_async,
     fetch_system_secrets_async,
@@ -143,7 +145,7 @@ from src.services.kl_service import (
     upsert_system_vdb_profile_async,
     health_status,
     fetch_documents_async,
-    fetch_document_download_info_async,
+    fetch_document_download_payload_async,
     fetch_documents_summary_async,
     delete_document_async,
     create_cabinet_chunking_run_async,
@@ -178,8 +180,39 @@ from src.resources.auth import create_access_token
 from src.resources.redis import build_redis_client, get_redis_client
 from src.config import WorkerMessageType, settings, worker_stream_router
 
+logger = logging.getLogger(__name__)
+
 api_router = APIRouter()
 _RESOURCE_DIR = Path(__file__).resolve().parents[1] / "resources"
+
+
+def _to_cabinet_response_item(cabinet) -> CabinetItemResponse:
+    profile = cabinet.object_storage_profile
+    storage_profile = None
+    if profile is not None:
+        storage_profile = CabinetStorageProfileResponse(
+            storage_provider=(
+                str(profile.provider).lower() if profile.provider else None
+            ),
+            storage_endpoint=profile.endpoint,
+            storage_use_ssl=profile.use_ssl,
+            storage_path_style=profile.force_path_style,
+            storage_region=profile.region,
+            storage_bucket_name=profile.bucket_name,
+            storage_base_prefix=profile.base_prefix,
+            storage_access_key=profile.access_key,
+        )
+    return CabinetItemResponse(
+        id=cabinet.id,
+        project_id=cabinet.project_id,
+        cabinet_uuid=cabinet.cabinet_uuid,
+        name=cabinet.name,
+        storage_profile=storage_profile,
+        vector_store=cabinet.vector_store,
+        collection_name=cabinet.collection_name,
+        system_profile=cabinet.system_profile,
+        is_active=cabinet.is_active,
+    )
 
 
 def _load_resource_json(filename: str):
@@ -851,8 +884,7 @@ async def delete_embedding_model_config(
 async def get_storages(
     db: aiomysql.Connection = Depends(async_get_db),
 ):
-    items = await fetch_storage_types_async(db)
-    return StoragesResponse(items=items)
+    return StoragesResponse(items=["minio"])
 
 
 @api_router.get(
@@ -1040,7 +1072,9 @@ async def get_cabinets(
     db: aiomysql.Connection = Depends(async_get_db),
 ):
     items = await fetch_cabinets_by_project_async(db, project_id=project_id)
-    return CabinetsResponse(items=items)
+    return CabinetsResponse(
+        items=[_to_cabinet_response_item(item) for item in items]
+    )
 
 
 @api_router.get("/api/cabinet", tags=["cabinets"], response_model=CabinetResponse)
@@ -1056,7 +1090,7 @@ async def get_cabinet(
     )
     if item is None:
         raise HTTPException(status_code=404, detail="Cabinet not found")
-    return CabinetResponse(item=item)
+    return CabinetResponse(item=_to_cabinet_response_item(item))
 
 
 @api_router.post("/api/cabinet", tags=["cabinets"], response_model=CabinetResponse)
@@ -1069,7 +1103,7 @@ async def create_cabinet(
         raise HTTPException(status_code=404, detail="System profile not found")
     if cabinet is None:
         raise HTTPException(status_code=500, detail="Failed to create cabinet")
-    return CabinetResponse(item=cabinet)
+    return CabinetResponse(item=_to_cabinet_response_item(cabinet))
 
 
 @api_router.put("/api/cabinet", tags=["cabinets"], response_model=CabinetResponse)
@@ -1088,7 +1122,7 @@ async def update_cabinet(
         raise HTTPException(
             status_code=500, detail="Failed to update cabinet"
         )
-    return CabinetResponse(item=cabinet)
+    return CabinetResponse(item=_to_cabinet_response_item(cabinet))
 
 
 @api_router.delete(
@@ -1140,7 +1174,7 @@ async def activate_cabinet(
         raise HTTPException(
             status_code=500, detail={"message": "Failed to update cabinet"}
         )
-    return CabinetResponse(item=cabinet)
+    return CabinetResponse(item=_to_cabinet_response_item(cabinet))
 
 
 @api_router.patch(
@@ -1163,7 +1197,7 @@ async def deactivate_cabinet(
         raise HTTPException(
             status_code=500, detail={"message": "Failed to update cabinet"}
         )
-    return CabinetResponse(item=cabinet)
+    return CabinetResponse(item=_to_cabinet_response_item(cabinet))
 
 
 @api_router.get(
@@ -1238,21 +1272,51 @@ async def download_document(
     document_uuid: str = Query(..., min_length=1),
     db: aiomysql.Connection = Depends(async_get_db),
 ):
-    info = await fetch_document_download_info_async(
+    import asyncio
+    from urllib.parse import quote
+
+    payload = await fetch_document_download_payload_async(
         db, document_uuid=document_uuid
     )
-    if info is None:
+    if payload is None:
         raise HTTPException(status_code=404, detail="Document not found")
-    file_path = info["file_path"]
-    file_name = info["file_name"]
-    try:
-        return FileResponse(
-            path=file_path,
-            filename=file_name,
-            media_type="application/octet-stream",
+    media_type = str(payload.get("content_type") or "").strip()
+    if not media_type:
+        media_type = "application/pdf"
+        if str(payload.get("file_type") or "").lower() not in {"pdf"}:
+            media_type = "application/octet-stream"
+    file_name = str(payload["file_name"])
+    ascii_name = file_name.encode("ascii", errors="ignore").decode("ascii").strip()
+    if not ascii_name:
+        ascii_name = "download"
+    ascii_name = ascii_name.replace('"', "")
+    encoded_name = quote(file_name, safe="")
+    headers = {
+        "Content-Disposition": (
+            f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}"
         )
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="File not found")
+    }
+    content_length = payload.get("content_length")
+    if content_length is not None:
+        headers["Content-Length"] = str(content_length)
+
+    body = payload["body"]
+
+    async def _stream_object():
+        try:
+            while True:
+                chunk = await asyncio.to_thread(body.read, 1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            await asyncio.to_thread(body.close)
+
+    return StreamingResponse(
+        _stream_object(),
+        media_type=media_type,
+        headers=headers,
+    )
 
 
 @api_router.delete(
@@ -1273,7 +1337,7 @@ async def delete_document(
         if reason == "parsing":
             raise HTTPException(
                 status_code=409,
-                detail="문서 변환중에는 삭제할 수 없읍니다",
+                detail="문서 변환중에는 삭제할 수 없습니다",
             )
         if reason == "file_delete_failed":
             raise HTTPException(
@@ -1863,10 +1927,6 @@ async def upload_documents(
     db: aiomysql.Connection = Depends(async_get_db),
 ):
     import logging
-    import os
-    from pathlib import Path
-
-    logger = logging.getLogger(__name__)
 
     def _should_expose_error_detail() -> bool:
         return settings.expose_internal_error_detail or settings.env.lower() in {
@@ -1897,14 +1957,6 @@ async def upload_documents(
         raise HTTPException(status_code=404, detail="Cabinet not found")
     if cabinet.is_active is False:
         raise HTTPException(status_code=403, detail="Cabinet is inactive")
-    if not cabinet.storage_base_path:
-        raise HTTPException(
-            status_code=400, detail="Cabinet storage_base_path is missing"
-        )
-    if not cabinet.storage_path:
-        raise HTTPException(
-            status_code=400, detail="Cabinet storage_path is missing"
-        )
     if not cabinet.vector_store:
         raise HTTPException(
             status_code=400, detail="Cabinet vector_store is missing"
@@ -1913,70 +1965,40 @@ async def upload_documents(
         raise HTTPException(
             status_code=400, detail="Cabinet system_profile is missing"
         )
-
-    base_dir = Path(cabinet.storage_base_path)
-    rel_path = Path(cabinet.storage_path)
-    if rel_path.is_absolute():
-        raise HTTPException(
-            status_code=400, detail="Cabinet storage_path must be relative"
-        )
-    target_dir = base_dir / rel_path
-    if ".." in target_dir.parts:
-        raise HTTPException(
-            status_code=400, detail="Cabinet storage_path is invalid"
-        )
-
-    logger.info(
-        "upload validation paths: cabinet_uuid=%s base=%r storage_path=%r target=%r base_exists=%s base_is_dir=%s target_exists=%s target_parent=%r",
-        cabinet.cabinet_uuid,
-        cabinet.storage_base_path,
-        cabinet.storage_path,
-        str(target_dir),
-        base_dir.exists(),
-        base_dir.is_dir(),
-        target_dir.exists(),
-        str(target_dir.parent),
-    )
-
-    def _is_writable_dir(path: Path) -> bool:
-        if path.exists():
-            return path.is_dir() and os.access(path, os.W_OK)
-        parent = path.parent
-        return parent.exists() and os.access(parent, os.W_OK)
-
-    if base_dir.is_absolute() and not _is_writable_dir(base_dir):
-        logger.warning(
-            "upload validation failed: cabinet_uuid=%s base=%r exists=%s is_dir=%s writable=%s parent=%r parent_exists=%s parent_writable=%s",
+    if cabinet.object_storage_profile is not None:
+        profile = cabinet.object_storage_profile
+        if profile.is_active is False:
+            raise HTTPException(
+                status_code=403,
+                detail="Cabinet object_storage_profile is inactive",
+            )
+        if str(profile.provider or "").upper() not in ("", "MINIO"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only MINIO object storage is supported",
+            )
+        if not profile.endpoint:
+            raise HTTPException(
+                status_code=400,
+                detail="Cabinet object_storage_profile endpoint is missing",
+            )
+        if not profile.bucket_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Cabinet object_storage_profile bucket_name is missing",
+            )
+        logger.info(
+            "upload validation object storage: cabinet_uuid=%s provider=%s endpoint=%r bucket=%r base_prefix=%r",
             cabinet.cabinet_uuid,
-            cabinet.storage_base_path,
-            base_dir.exists(),
-            base_dir.is_dir(),
-            os.access(base_dir, os.W_OK),
-            str(base_dir.parent),
-            base_dir.parent.exists(),
-            os.access(base_dir.parent, os.W_OK),
+            profile.provider,
+            profile.endpoint,
+            profile.bucket_name,
+            profile.base_prefix,
         )
+    else:
         raise HTTPException(
-            status_code=403,
-            detail=(
-                "Cabinet storage_base_path is not writable or accessible"
-            ),
-        )
-    if target_dir.is_absolute() and not _is_writable_dir(target_dir):
-        logger.warning(
-            "upload validation failed: cabinet_uuid=%s target=%r exists=%s is_dir=%s writable=%s parent=%r parent_exists=%s parent_writable=%s",
-            cabinet.cabinet_uuid,
-            str(target_dir),
-            target_dir.exists(),
-            target_dir.is_dir(),
-            os.access(target_dir, os.W_OK),
-            str(target_dir.parent),
-            target_dir.parent.exists(),
-            os.access(target_dir.parent, os.W_OK),
-        )
-        raise HTTPException(
-            status_code=403,
-            detail="Cabinet storage_path is not writable or accessible",
+            status_code=400,
+            detail="Cabinet object_storage_profile is required",
         )
     try:
         items = await save_uploaded_documents_async(

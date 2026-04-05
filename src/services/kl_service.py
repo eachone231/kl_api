@@ -200,6 +200,21 @@ def _clean_optional_row(data: dict[str, object]) -> dict[str, object] | None:
     return data
 
 
+def _coerce_db_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off", ""}:
+        return False
+    return bool(value)
+
+
 def _build_system_profile_from_row(
     row: dict[str, object],
 ) -> "SystemProfileItem | None":
@@ -230,6 +245,39 @@ def _build_system_profile_from_row(
         llm_model=llm_model,
         embedding_model=embedding_model,
     )
+
+
+def _build_env_object_storage_profile() -> "ObjectStorageProfileItem":
+    from src.config import settings
+    from src.model.kl_models import ObjectStorageProfileItem
+
+    provider = str(settings.storage_provider or "").strip()
+    if not provider:
+        raise RuntimeError("STORAGE_PROVIDER is not configured")
+    endpoint = str(settings.storage_endpoint or "").strip()
+    if not endpoint:
+        raise RuntimeError("STORAGE_ENDPOINT is not configured")
+    bucket_name = str(settings.storage_bucket_name or "").strip()
+    if not bucket_name:
+        raise RuntimeError("STORAGE_BUCKET_NAME is not configured")
+    return ObjectStorageProfileItem(
+        provider=provider.upper(),
+        endpoint=endpoint,
+        bucket_name=bucket_name,
+        region=str(settings.storage_region or "").strip() or None,
+        base_prefix=str(settings.storage_base_prefix or "").strip() or None,
+        use_ssl=bool(settings.storage_use_ssl),
+        access_key=settings.storage_access_key,
+        secret_key=settings.storage_secret_key,
+        force_path_style=bool(settings.storage_path_style),
+        is_active=True,
+    )
+
+
+def _resolve_cabinet_object_storage_profile(
+    row: dict[str, object] | None = None,
+) -> "ObjectStorageProfileItem":
+    return _build_env_object_storage_profile()
 
 
 async def fetch_system_profiles_async(
@@ -939,20 +987,6 @@ async def delete_embedding_model_config_async(
     return True
 
 
-async def fetch_storage_types_async(db) -> list[str]:
-    import aiomysql
-
-    qry = """
-    SELECT storage_type
-    FROM storages
-    ORDER BY storage_type
-    """
-    async with db.cursor(aiomysql.DictCursor) as cursor:
-        await cursor.execute(qry)
-        rows = await cursor.fetchall()
-    return [row["storage_type"] for row in rows]
-
-
 async def fetch_vector_stores_async(db) -> list[str]:
     import aiomysql
 
@@ -1562,11 +1596,6 @@ async def fetch_projects_summary_async(
 
 
 async def _build_cabinet_select_sql(db, table_alias: str = "c") -> str:
-    storage_cols = await _resolve_cabinet_storage_columns_async(db)
-    storage_type_col = storage_cols["storage_type"]
-    base_path_col = storage_cols["storage_base_path"]
-    upload_path_col = storage_cols["storage_path"]
-
     sp_columns = await _get_table_columns_async(db, "system_profiles")
     llm_config_columns = await _get_table_columns_async(db, "llm_model_configs")
     embedding_config_columns = await _get_table_columns_async(
@@ -1579,9 +1608,6 @@ async def _build_cabinet_select_sql(db, table_alias: str = "c") -> str:
         f"{table_alias}.project_id",
         f"{table_alias}.cabinet_uuid",
         f"{table_alias}.cabinet_name",
-        f"{table_alias}.{storage_type_col} AS storage_type",
-        f"{table_alias}.{base_path_col} AS storage_base_path",
-        f"{table_alias}.{upload_path_col} AS storage_path",
         f"{table_alias}.vector_store",
         f"{table_alias}.collection_name",
         f"{table_alias}.is_active",
@@ -1634,9 +1660,8 @@ async def fetch_cabinets_by_project_async(db, project_id: int) -> list["Cabinet"
             project_id=row["project_id"],
             cabinet_uuid=row["cabinet_uuid"],
             name=row["cabinet_name"],
-            storage_type=row["storage_type"],
-            storage_base_path=row["storage_base_path"],
-            storage_path=row["storage_path"],
+            storage_type=str(_resolve_cabinet_object_storage_profile(row).provider).lower(),
+            object_storage_profile=_resolve_cabinet_object_storage_profile(row),
             vector_store=row["vector_store"],
             collection_name=row["collection_name"],
             system_profile=_build_system_profile_from_row(row),
@@ -1676,14 +1701,14 @@ async def fetch_cabinet_by_project_uuid_async(
         row = await cursor.fetchone()
     if row is None:
         return None
+    profile = _resolve_cabinet_object_storage_profile(row)
     return Cabinet(
         id=row["id"],
         project_id=row["project_id"],
         cabinet_uuid=row["cabinet_uuid"],
         name=row["cabinet_name"],
-        storage_type=row["storage_type"],
-        storage_base_path=row["storage_base_path"],
-        storage_path=row["storage_path"],
+        storage_type=str(profile.provider).lower(),
+        object_storage_profile=profile,
         vector_store=row["vector_store"],
         collection_name=row["collection_name"],
         system_profile=_build_system_profile_from_row(row),
@@ -1716,14 +1741,14 @@ async def fetch_cabinet_by_uuid_async(
         row = await cursor.fetchone()
     if row is None:
         return None
+    profile = _resolve_cabinet_object_storage_profile(row)
     return Cabinet(
         id=row["id"],
         project_id=row["project_id"],
         cabinet_uuid=row["cabinet_uuid"],
         name=row["cabinet_name"],
-        storage_type=row["storage_type"],
-        storage_base_path=row["storage_base_path"],
-        storage_path=row["storage_path"],
+        storage_type=str(profile.provider).lower(),
+        object_storage_profile=profile,
         vector_store=row["vector_store"],
         collection_name=row["collection_name"],
         system_profile=_build_system_profile_from_row(row),
@@ -1742,14 +1767,16 @@ async def update_cabinet_async(
     if not isinstance(payload, CabinetUpdateRequest):
         raise TypeError("payload must be CabinetUpdateRequest")
 
-    storage_cols = await _resolve_cabinet_storage_columns_async(db)
-    storage_type_col = storage_cols["storage_type"]
-    base_path_col = storage_cols["storage_base_path"]
-    upload_path_col = storage_cols["storage_path"]
-
     columns = await _get_cabinets_columns_async(db)
     if "system_profile_id" not in columns:
         raise RuntimeError("cabinets table missing system_profile_id")
+
+    supported_provider = str(_build_env_object_storage_profile().provider).lower()
+    normalized_storage_type = (
+        str(payload.storage_type or supported_provider).strip().lower()
+    )
+    if normalized_storage_type != supported_provider:
+        raise RuntimeError(f"Only {supported_provider} storage_type is supported")
 
     cabinet_qry = """
     SELECT id
@@ -1762,9 +1789,6 @@ async def update_cabinet_async(
     UPDATE cabinets
     SET
         cabinet_name = %(name)s,
-        {storage_type_col} = %(storage_type)s,
-        {base_path_col} = %(storage_base_path)s,
-        {upload_path_col} = %(storage_path)s,
         vector_store = %(vector_store)s,
         collection_name = %(collection_name)s,
         system_profile_id = %(system_profile_id)s,
@@ -1789,9 +1813,6 @@ async def update_cabinet_async(
         "project_id": payload.project_id,
         "cabinet_uuid": payload.cabinet_uuid,
         "name": payload.name,
-        "storage_type": payload.storage_type,
-        "storage_base_path": payload.storage_base_path,
-        "storage_path": payload.storage_path,
         "vector_store": payload.vector_store,
         "collection_name": payload.collection_name,
         "system_profile_id": payload.system_profile_id,
@@ -1816,14 +1837,14 @@ async def update_cabinet_async(
 
     if row is None:
         return True, None, "update_failed"
+    profile = _resolve_cabinet_object_storage_profile(row)
     return True, Cabinet(
         id=row["id"],
         project_id=row["project_id"],
         cabinet_uuid=row["cabinet_uuid"],
         name=row["cabinet_name"],
-        storage_type=row["storage_type"],
-        storage_base_path=row["storage_base_path"],
-        storage_path=row["storage_path"],
+        storage_type=str(profile.provider).lower(),
+        object_storage_profile=profile,
         vector_store=row["vector_store"],
         collection_name=row["collection_name"],
         system_profile=_build_system_profile_from_row(row),
@@ -1940,9 +1961,7 @@ async def delete_cabinet_async(
     SELECT
         id,
         vector_store,
-        collection_name,
-        storage_base_path,
-        storage_path
+        collection_name
     FROM cabinets
     WHERE cabinet_uuid = %(cabinet_uuid)s
     LIMIT 1
@@ -2057,14 +2076,9 @@ async def create_cabinet_async(
 
     columns = await _get_cabinets_columns_async(db)
     column_names = set(columns.keys())
-    storage_cols = await _resolve_cabinet_storage_columns_async(db)
-    storage_type_col = storage_cols["storage_type"]
-    base_path_col = storage_cols["storage_base_path"]
-    upload_path_col = storage_cols["storage_path"]
 
     if "system_profile_id" not in column_names:
         raise RuntimeError("cabinets table missing system_profile_id")
-
     exists_qry = "SELECT id FROM system_profiles WHERE id = %(id)s LIMIT 1"
     async with db.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute(exists_qry, {"id": payload.system_profile_id})
@@ -2072,32 +2086,38 @@ async def create_cabinet_async(
     if row is None:
         return False, None
 
-    insert_columns_sql = [
+    env_profile = _build_env_object_storage_profile()
+    normalized_storage_type = (
+        str(payload.storage_type or env_profile.provider).strip().lower()
+    )
+    if normalized_storage_type != str(env_profile.provider).lower():
+        raise RuntimeError(
+            f"Only {str(env_profile.provider).lower()} storage_type is supported"
+        )
+
+    cabinet_uuid = str(uuid4())
+    cabinet_insert_columns_sql = [
         "project_id",
         "cabinet_uuid",
         "cabinet_name",
-        storage_type_col,
-        base_path_col,
-        upload_path_col,
         "vector_store",
         "collection_name",
         "system_profile_id",
     ]
-    values_sql = ", ".join(
+    cabinet_values_sql = ", ".join(
         [
             "%(project_id)s",
             "%(cabinet_uuid)s",
             "%(cabinet_name)s",
-            "%(storage_type)s",
-            "%(storage_base_path)s",
-            "%(storage_path)s",
             "%(vector_store)s",
             "%(collection_name)s",
             "%(system_profile_id)s",
         ]
     )
-    columns_sql = ", ".join(insert_columns_sql)
-    insert_qry = f"INSERT INTO cabinets ({columns_sql}) VALUES ({values_sql})"
+    cabinet_columns_sql = ", ".join(cabinet_insert_columns_sql)
+    cabinet_insert_qry = (
+        f"INSERT INTO cabinets ({cabinet_columns_sql}) VALUES ({cabinet_values_sql})"
+    )
     select_sql = await _build_cabinet_select_sql(db, table_alias="c")
     select_qry = f"""
     SELECT {select_sql}
@@ -2110,34 +2130,30 @@ async def create_cabinet_async(
     WHERE c.cabinet_uuid = %(cabinet_uuid)s
     LIMIT 1
     """
-    cabinet_uuid = str(uuid4())
-    params = {
+    cabinet_params = {
         "project_id": payload.project_id,
         "cabinet_uuid": cabinet_uuid,
         "cabinet_name": payload.name,
         "vector_store": payload.vector_store,
         "collection_name": payload.collection_name,
-        "storage_type": payload.storage_type,
-        "storage_base_path": payload.storage_base_path,
-        "storage_path": payload.storage_path,
         "system_profile_id": payload.system_profile_id,
     }
 
     async with db.cursor(aiomysql.DictCursor) as cursor:
-        await cursor.execute(insert_qry, params)
+        await cursor.execute(cabinet_insert_qry, cabinet_params)
         await cursor.execute(select_qry, {"cabinet_uuid": cabinet_uuid})
         row = await cursor.fetchone()
 
     if row is None:
         return True, None
+    profile = _resolve_cabinet_object_storage_profile(row)
     return True, Cabinet(
         id=row["id"],
         project_id=row["project_id"],
         cabinet_uuid=row["cabinet_uuid"],
         name=row["cabinet_name"],
-        storage_type=row["storage_type"],
-        storage_base_path=row["storage_base_path"],
-        storage_path=row["storage_path"],
+        storage_type=str(profile.provider).lower(),
+        object_storage_profile=profile,
         vector_store=row["vector_store"],
         collection_name=row["collection_name"],
         system_profile=_build_system_profile_from_row(row),
@@ -2569,44 +2585,6 @@ def _pick_first_column(columns: set[str], candidates: tuple[str, ...]) -> str | 
     return None
 
 
-async def _resolve_cabinet_storage_columns_async(
-    db,
-) -> dict[str, str]:
-    columns = await _get_cabinets_columns_async(db)
-    column_names = set(columns.keys())
-    storage_type = _pick_first_column(
-        column_names,
-        ("storage_type",),
-    )
-    base_path = _pick_first_column(
-        column_names,
-        ("storage_base_path", "storage_root_path", "base_path", "root_path"),
-    )
-    upload_path = _pick_first_column(
-        column_names,
-        ("storage_path", "storage_base", "upload_path", "storage_upload_path"),
-    )
-    if not storage_type or not base_path or not upload_path:
-        missing = [
-            name
-            for name, value in (
-                ("storage_type", storage_type),
-                ("storage_base_path", base_path),
-                ("storage_path", upload_path),
-            )
-            if value is None
-        ]
-        raise RuntimeError(
-            "cabinets table is missing expected storage columns: "
-            + ", ".join(missing)
-        )
-    return {
-        "storage_type": f"`{storage_type}`",
-        "storage_base_path": f"`{base_path}`",
-        "storage_path": f"`{upload_path}`",
-    }
-
-
 def _first_enum_value(column_type: str | None) -> str | None:
     if not column_type or not column_type.startswith("enum("):
         return None
@@ -2655,16 +2633,112 @@ async def _get_documents_columns_async(
     return _DOCUMENTS_COLUMNS
 
 
+def _normalize_object_storage_path_part(value: str | None) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().strip("/")
+
+
+def _build_document_object_key(
+    bucket_name: str,
+    base_prefix: str | None,
+    cabinet_uuid: str,
+    doc_uuid: str,
+    file_name: str,
+) -> tuple[str, str]:
+    bucket = _normalize_object_storage_path_part(bucket_name)
+    if not bucket:
+        raise RuntimeError("Object storage bucket_name is missing")
+    safe_name = file_name.strip().lstrip("/")
+    if not safe_name:
+        raise RuntimeError("file_name is required")
+    object_name_parts = [
+        part
+        for part in (
+            _normalize_object_storage_path_part(base_prefix),
+            _normalize_object_storage_path_part(cabinet_uuid),
+            _normalize_object_storage_path_part(doc_uuid),
+            safe_name,
+        )
+        if part
+    ]
+    object_name = "/".join(object_name_parts)
+    object_key = "/".join([bucket, object_name]) if object_name else bucket
+    return object_key, object_name
+
+
+async def _resolve_object_storage_credentials_async(
+    db,
+    profile: "ObjectStorageProfileItem",
+) -> tuple[str | None, str | None]:
+    from src.resources.crypto_env import decrypt_secret
+
+    access_key = profile.access_key
+    secret_key = profile.secret_key
+    if isinstance(access_key, str):
+        access_key = decrypt_secret(access_key)
+    if isinstance(secret_key, str):
+        secret_key = decrypt_secret(secret_key)
+    return access_key, secret_key
+
+
+def _build_object_storage_endpoint(
+    profile: "ObjectStorageProfileItem",
+) -> tuple[str, bool]:
+    endpoint = str(profile.endpoint or "").strip()
+    if not endpoint:
+        raise RuntimeError("Object storage endpoint is missing")
+    if endpoint.startswith("http://"):
+        return endpoint.rstrip("/"), False
+    if endpoint.startswith("https://"):
+        return endpoint.rstrip("/"), True
+    if profile.use_ssl is None:
+        scheme = "http"
+        use_ssl = False
+    else:
+        use_ssl = profile.use_ssl
+        scheme = "https" if use_ssl else "http"
+    return f"{scheme}://{endpoint}".rstrip("/"), use_ssl
+
+
+def _build_s3_client(
+    access_key: str | None,
+    secret_key: str | None,
+    profile: "ObjectStorageProfileItem",
+):
+    import boto3
+    from botocore.config import Config
+
+    endpoint_url, use_ssl = _build_object_storage_endpoint(profile)
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=(profile.region or None),
+        use_ssl=use_ssl,
+        config=Config(
+            s3={
+                "addressing_style": (
+                    "path" if profile.force_path_style is not False else "virtual"
+                )
+            }
+        ),
+    )
+
+
 async def save_uploaded_documents_async(
     db,
     cabinet: "Cabinet",
     files: list["UploadFile"],
 ) -> list["DocumentListItem"]:
-    import os
     import logging
+    import os
     from datetime import datetime
     from pathlib import Path
     from uuid import uuid4
+    import asyncio
 
     import aiomysql
 
@@ -2681,39 +2755,21 @@ async def save_uploaded_documents_async(
     if not files:
         return []
 
-    if not cabinet.storage_base_path:
-        raise RuntimeError("Cabinet storage_base_path is missing")
-    storage_type = (cabinet.storage_type or "").upper()
-    if storage_type and storage_type not in ("LOCAL", "FILESYSTEM", "NFS"):
-        raise RuntimeError(f"Unsupported storage_type: {cabinet.storage_type}")
-
-    def _is_writable_dir(path: Path) -> bool:
-        if path.exists():
-            return path.is_dir() and os.access(path, os.W_OK)
-        parent = path.parent
-        return parent.exists() and os.access(parent, os.W_OK)
-
-    base_dir = Path(cabinet.storage_base_path)
-    if base_dir.is_absolute() and not _is_writable_dir(base_dir):
-        raise RuntimeError(
-            f"storage_base_path is not writable: {cabinet.storage_base_path}"
-        )
-    if cabinet.storage_path:
-        storage_path = Path(cabinet.storage_path)
-        if storage_path.is_absolute():
-            storage_path = Path(str(storage_path).lstrip("/"))
-        base_dir = base_dir / storage_path
-    if base_dir.is_absolute() and not _is_writable_dir(base_dir):
-        raise RuntimeError(
-            f"storage_base_path is not writable: {base_dir}"
-        )
-    logger.info(
-        "upload target resolved: root=%s storage_path=%s final=%s",
-        cabinet.storage_base_path,
-        cabinet.storage_path,
-        base_dir,
+    object_profile = cabinet.object_storage_profile
+    if object_profile is None:
+        raise RuntimeError("Cabinet object_storage_profile is required")
+    if object_profile.is_active is False:
+        raise RuntimeError("Object storage profile is inactive")
+    provider = str(object_profile.provider or "").upper()
+    if provider and provider != "MINIO":
+        raise RuntimeError(f"Unsupported object storage provider: {provider}")
+    bucket_name = str(object_profile.bucket_name or "").strip()
+    if not bucket_name:
+        raise RuntimeError("Object storage bucket_name is missing")
+    access_key, secret_key = await _resolve_object_storage_credentials_async(
+        db, object_profile
     )
-    base_dir.mkdir(parents=True, exist_ok=True)
+    s3_client = _build_s3_client(access_key, secret_key, object_profile)
 
     columns = await _get_documents_columns_async(db)
     if "cabinet_uuid" not in columns:
@@ -2757,35 +2813,38 @@ async def save_uploaded_documents_async(
                 original_name = "upload"
             suffix = Path(original_name).suffix
             doc_uuid = str(uuid4())
-            saved_name = f"{doc_uuid}{suffix}"
-            target_path = base_dir / saved_name
-            if target_path.exists():
-                doc_uuid = str(uuid4())
-                saved_name = f"{doc_uuid}{suffix}"
-                target_path = base_dir / saved_name
-
-            size = 0
             try:
                 await upload.seek(0)
             except Exception:
                 pass
-            with target_path.open("wb") as handle:
-                while True:
-                    chunk = await upload.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    handle.write(chunk)
-                    size += len(chunk)
-
-            await upload.close()
+            data = await upload.read()
+            size = len(data or b"")
+            assert object_profile is not None
+            assert s3_client is not None
+            object_key, object_name = _build_document_object_key(
+                bucket_name=bucket_name,
+                base_prefix=object_profile.base_prefix,
+                cabinet_uuid=cabinet.cabinet_uuid,
+                doc_uuid=doc_uuid,
+                file_name=original_name,
+            )
+            await asyncio.to_thread(
+                s3_client.put_object,
+                Bucket=bucket_name,
+                Key=object_name,
+                Body=data,
+                ContentType=upload.content_type or "application/octet-stream",
+            )
             logger.info(
-                "upload saved: name=%s path=%s size=%s",
-                saved_name,
-                target_path,
+                "upload saved to object storage: bucket=%s object_name=%s size=%s",
+                bucket_name,
+                object_name,
                 size,
             )
 
-            suffix = Path(saved_name).suffix.lower()
+            await upload.close()
+
+            suffix = Path(original_name).suffix.lower()
             file_type = suffix.lstrip(".").lower() or "bin"
             values: dict[str, object] = {
                 "doc_uuid": doc_uuid,
@@ -2796,10 +2855,8 @@ async def save_uploaded_documents_async(
                 "processing_step": None,
                 "created_at": now,
                 "updated_at": now,
-                "storage_path": str(target_path),
-                "file_path": str(target_path),
-                "path": str(target_path),
             }
+            values["object_key"] = object_key
             values["cabinet_uuid"] = cabinet.cabinet_uuid
             if latest_chunking_run_id is not None:
                 values["chunking_run_id"] = latest_chunking_run_id
@@ -2882,6 +2939,11 @@ async def save_uploaded_documents_async(
                     file_name=original_name,
                     file_type=file_type,
                     file_size=size,
+                    storage_type="object_storage",
+                    storage_provider=str(object_profile.provider or "MINIO").lower(),
+                    object_key=object_key,
+                    bucket_name=bucket_name,
+                    object_name=object_name,
                     status=str(status_value),
                     processing_step=str(step_value),
                     chunking_run_id=latest_chunking_run_id,
@@ -3028,39 +3090,168 @@ async def fetch_documents_async(
     return items, total_items
 
 
+def _split_bucket_and_object_name(object_key: str) -> tuple[str, str]:
+    normalized = str(object_key or "").strip().strip("/")
+    if not normalized or "/" not in normalized:
+        raise RuntimeError("Invalid object_key")
+    bucket_name, object_name = normalized.split("/", 1)
+    if not bucket_name or not object_name:
+        raise RuntimeError("Invalid object_key")
+    return bucket_name, object_name
+
+
+def _build_document_auxiliary_object_targets(
+    *,
+    base_prefix: str | None,
+    cabinet_uuid: str,
+    document_uuid: str,
+    object_name: str,
+) -> tuple[list[str], list[str]]:
+    normalized_base = _normalize_object_storage_path_part(base_prefix)
+    normalized_cabinet = _normalize_object_storage_path_part(cabinet_uuid)
+    normalized_doc = _normalize_object_storage_path_part(document_uuid)
+    if not normalized_cabinet or not normalized_doc:
+        return [], []
+
+    doc_root = "/".join(
+        part
+        for part in (normalized_base, normalized_cabinet, normalized_doc)
+        if part
+    )
+    exact_keys = [
+        "/".join(
+            part
+            for part in (
+                doc_root,
+                "html",
+                f"{normalized_doc}.html",
+            )
+            if part
+        ),
+        "/".join(
+            part
+            for part in (
+                doc_root,
+                "md",
+                f"{normalized_doc}.md",
+            )
+            if part
+        ),
+    ]
+    prefix_keys = [
+        "/".join(
+            part
+            for part in (
+                doc_root,
+                "imgs",
+                normalized_doc,
+            )
+            if part
+        ),
+        "/".join(
+            part
+            for part in (
+                doc_root,
+                "tbls",
+                normalized_doc,
+            )
+            if part
+        ),
+    ]
+    exact_keys = [key for key in dict.fromkeys(exact_keys) if key]
+    prefix_keys = [key for key in dict.fromkeys(prefix_keys) if key]
+    return exact_keys, prefix_keys
+
+
+def _resolve_object_storage_file_info(
+    *,
+    row: dict[str, object],
+    document_uuid: str,
+    file_name: str,
+    object_key: str | None,
+) -> dict[str, str] | None:
+    raw_object_key = str(object_key or "").strip()
+    if raw_object_key:
+        bucket_name, object_name = _split_bucket_and_object_name(raw_object_key)
+        return {
+            "object_key": raw_object_key,
+            "bucket_name": bucket_name,
+            "object_name": object_name,
+        }
+
+    profile = _resolve_cabinet_object_storage_profile(row)
+    bucket_name = str(profile.bucket_name or "").strip()
+
+    resolved_object_key, object_name = _build_document_object_key(
+        bucket_name=bucket_name,
+        base_prefix=profile.base_prefix,
+        cabinet_uuid=str(row.get("cabinet_uuid") or "").strip(),
+        doc_uuid=document_uuid,
+        file_name=file_name,
+    )
+    return {
+        "object_key": resolved_object_key,
+        "bucket_name": bucket_name,
+        "object_name": object_name,
+    }
+
+
+def _build_object_storage_profile_from_document_row(
+    row: dict[str, object],
+) -> "ObjectStorageProfileItem":
+    return _resolve_cabinet_object_storage_profile(row)
+
+
+async def _open_object_storage_file_async(
+    db,
+    *,
+    object_key: str,
+    cabinet_row: dict[str, object],
+) -> dict[str, object]:
+    import asyncio
+
+    bucket_name, object_name = _split_bucket_and_object_name(object_key)
+    profile = _build_object_storage_profile_from_document_row(cabinet_row)
+    access_key, secret_key = await _resolve_object_storage_credentials_async(
+        db, profile
+    )
+    s3_client = _build_s3_client(access_key, secret_key, profile)
+    response = await asyncio.to_thread(
+        s3_client.get_object,
+        Bucket=bucket_name,
+        Key=object_name,
+    )
+    return {
+        "body": response["Body"],
+        "content_type": response.get("ContentType"),
+        "content_length": response.get("ContentLength"),
+    }
+
+
 async def fetch_document_download_info_async(
     db,
     document_uuid: str,
 ) -> dict[str, str] | None:
     import aiomysql
-    from pathlib import Path
 
     columns = await _get_documents_columns_async(db)
-    path_column = None
-    for candidate in ("storage_path", "file_path", "path"):
-        if candidate in columns:
-            path_column = candidate
-            break
+    has_object_key = "object_key" in columns
 
     cabinets_columns = await _get_cabinets_columns_async(db)
     if "cabinet_uuid" not in cabinets_columns:
         raise RuntimeError("cabinets table missing uuid column")
     if "cabinet_uuid" not in columns:
         raise RuntimeError("documents table missing cabinet_uuid column")
-
-    storage_cols = await _resolve_cabinet_storage_columns_async(db)
-    base_path_col = storage_cols["storage_base_path"]
-    storage_path_col = storage_cols["storage_path"]
-
-    select_path_sql = f", d.{path_column} AS file_path" if path_column else ""
+    select_object_key_sql = (
+        ", d.object_key AS object_key" if has_object_key else ", NULL AS object_key"
+    )
     qry = f"""
     SELECT
         d.doc_uuid AS document_uuid,
+        d.cabinet_uuid,
         d.file_name,
-        d.file_type,
-        c.{base_path_col} AS storage_base_path,
-        c.{storage_path_col} AS storage_path
-        {select_path_sql}
+        d.file_type
+        {select_object_key_sql}
     FROM documents d
     JOIN cabinets c ON d.cabinet_uuid = c.cabinet_uuid
     WHERE d.doc_uuid = %(document_uuid)s
@@ -3076,31 +3267,43 @@ async def fetch_document_download_info_async(
     if not file_name or not file_type:
         return None
 
-    file_path = row.get("file_path")
-    if file_path:
-        return {"file_path": str(file_path), "file_name": str(file_name)}
+    object_info = _resolve_object_storage_file_info(
+        row=row,
+        document_uuid=str(row.get("document_uuid") or document_uuid),
+        file_name=str(file_name),
+        object_key=(str(row.get("object_key")) if row.get("object_key") else None),
+    )
+    if object_info:
+        return {
+            "file_name": str(file_name),
+            "file_type": str(file_type),
+            "cabinet_uuid": str(row.get("cabinet_uuid") or ""),
+            "object_key": object_info["object_key"],
+            "bucket_name": object_info["bucket_name"],
+            "object_name": object_info["object_name"],
+        }
+    return None
 
-    storage_base_path = row.get("storage_base_path")
-    storage_path = row.get("storage_path")
-    if not storage_base_path:
+
+async def fetch_document_download_payload_async(
+    db,
+    document_uuid: str,
+) -> dict[str, object] | None:
+    info = await fetch_document_download_info_async(db, document_uuid=document_uuid)
+    if info is None:
         return None
-    safe_type = str(file_type).lstrip(".").strip() or "bin"
-    saved_name = f"{row.get('document_uuid')}.{safe_type}"
 
-    base_dir = Path(str(storage_base_path))
-    fallback_dir = (Path.cwd() / "upload").resolve()
-    if storage_path:
-        storage_path = str(storage_path)
-        if Path(storage_path).is_absolute():
-            storage_path = storage_path.lstrip("/")
-        base_dir = base_dir / storage_path
-    resolved_path = base_dir / saved_name
-    if resolved_path.exists():
-        return {"file_path": str(resolved_path), "file_name": str(file_name)}
-    fallback_path = fallback_dir / saved_name
+    stream_info = await _open_object_storage_file_async(
+        db,
+        object_key=str(info["object_key"]),
+        cabinet_row={},
+    )
     return {
-        "file_path": str(fallback_path if fallback_path.exists() else resolved_path),
-        "file_name": str(file_name),
+        "file_name": str(info["file_name"]),
+        "file_type": str(info.get("file_type") or "bin"),
+        "body": stream_info["body"],
+        "content_type": stream_info.get("content_type"),
+        "content_length": stream_info.get("content_length"),
     }
 
 
@@ -3109,20 +3312,16 @@ async def delete_document_async(
     document_uuid: str,
 ) -> tuple[bool, str | None]:
     import aiomysql
-    import os
     import asyncio
     import json
     import logging
-    from pathlib import Path
     from urllib import request as urllib_request
     from urllib.error import URLError, HTTPError
 
     logger = logging.getLogger(__name__)
 
     logger.info("delete_document start: doc_uuid=%s", document_uuid)
-    info = await fetch_document_download_info_async(
-        db, document_uuid=document_uuid
-    )
+    info = await fetch_document_download_info_async(db, document_uuid=document_uuid)
     exists_qry = """
     SELECT d.doc_uuid, d.processing_step, c.vector_store, c.collection_name
     FROM documents d
@@ -3214,6 +3413,69 @@ async def delete_document_async(
                             f"qdrant delete failed: response status={status_text}"
                         )
 
+        def _delete_by_document_uuid() -> None:
+            filter_payloads = [
+                {
+                    "filter": {
+                        "must": [
+                            {
+                                "key": key_name,
+                                "match": {"value": document_uuid},
+                            }
+                        ]
+                    }
+                }
+                for key_name in (
+                    "document_uuid",
+                    "doc_uuid",
+                    "metadata.document_uuid",
+                    "metadata.doc_uuid",
+                    "payload.document_uuid",
+                    "payload.doc_uuid",
+                )
+            ]
+            last_error: Exception | None = None
+            for payload_dict in filter_payloads:
+                payload = json.dumps(payload_dict).encode("utf-8")
+                try:
+                    _send(payload)
+                    logger.info(
+                        "qdrant delete fallback succeeded: url=%s payload=%s",
+                        url,
+                        payload.decode("utf-8", errors="replace"),
+                    )
+                    return
+                except HTTPError as exc:
+                    body = ""
+                    try:
+                        body = exc.read().decode("utf-8")
+                    except Exception:
+                        body = "<unreadable>"
+                    logger.error(
+                        "qdrant delete fallback http_error: url=%s payload=%s body=%s",
+                        url,
+                        payload.decode("utf-8", errors="replace"),
+                        body,
+                    )
+                    last_error = exc
+                    if exc.code != 400:
+                        raise
+                except RuntimeError as exc:
+                    logger.error(
+                        "qdrant delete fallback runtime_error: url=%s payload=%s error=%s",
+                        url,
+                        payload.decode("utf-8", errors="replace"),
+                        exc,
+                    )
+                    last_error = exc
+            if last_error is not None:
+                raise RuntimeError(
+                    f"qdrant delete fallback failed for document_uuid={document_uuid}"
+                ) from last_error
+            raise RuntimeError(
+                f"qdrant delete fallback failed for document_uuid={document_uuid}"
+            )
+
         uuid_pattern = re.compile(
             r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
             r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
@@ -3294,11 +3556,12 @@ async def delete_document_async(
 
         if deleted_by_ids:
             return
-        if valid_ids:
-            raise RuntimeError("qdrant delete failed for all vector_id values")
-        raise RuntimeError(
-            "qdrant delete failed: no valid vector_id values in embeddings"
+        logger.warning(
+            "qdrant delete switching to document_uuid fallback: doc_uuid=%s valid_ids=%s",
+            document_uuid,
+            len(valid_ids),
         )
+        _delete_by_document_uuid()
 
     async def _delete_vectors_if_needed() -> bool:
         normalized_store = str(vector_store or "").strip().lower()
@@ -3387,88 +3650,73 @@ async def delete_document_async(
         logger.error("delete_document vector_delete_failed: doc_uuid=%s", document_uuid)
         return False, "vector_delete_failed"
 
-    file_path = info["file_path"] if info else None
-    deleted_paths: list[str] = []
-    if file_path:
+    if info and info.get("object_key"):
+        profile = _build_env_object_storage_profile()
+        access_key, secret_key = await _resolve_object_storage_credentials_async(
+            db, profile
+        )
+        s3_client = _build_s3_client(access_key, secret_key, profile)
         try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                deleted_paths.append(file_path)
-            logger.info(
-                "delete_document file_deleted: doc_uuid=%s path=%s",
-                document_uuid,
-                file_path,
+            await asyncio.to_thread(
+                s3_client.delete_object,
+                Bucket=str(info["bucket_name"]),
+                Key=str(info["object_name"]),
             )
-        except OSError:
-            logger.error(
-                "delete_document file_delete_failed: doc_uuid=%s path=%s",
+            aux_exact_keys, aux_prefixes = _build_document_auxiliary_object_targets(
+                base_prefix=profile.base_prefix,
+                cabinet_uuid=str(info.get("cabinet_uuid") or ""),
+                document_uuid=document_uuid,
+                object_name=str(info["object_name"]),
+            )
+            deleted_aux_keys: list[str] = []
+            for key in aux_exact_keys:
+                await asyncio.to_thread(
+                    s3_client.delete_object,
+                    Bucket=str(info["bucket_name"]),
+                    Key=key,
+                )
+                deleted_aux_keys.append(key)
+
+            for prefix in aux_prefixes:
+                continuation_token = None
+                while True:
+                    list_kwargs = {
+                        "Bucket": str(info["bucket_name"]),
+                        "Prefix": prefix.rstrip("/") + "/",
+                    }
+                    if continuation_token:
+                        list_kwargs["ContinuationToken"] = continuation_token
+                    response = await asyncio.to_thread(
+                        s3_client.list_objects_v2,
+                        **list_kwargs,
+                    )
+                    contents = response.get("Contents") or []
+                    for entry in contents:
+                        key = str(entry.get("Key") or "").strip()
+                        if not key:
+                            continue
+                        await asyncio.to_thread(
+                            s3_client.delete_object,
+                            Bucket=str(info["bucket_name"]),
+                            Key=key,
+                        )
+                        deleted_aux_keys.append(key)
+                    if not response.get("IsTruncated"):
+                        break
+                    continuation_token = response.get("NextContinuationToken")
+            logger.info(
+                "delete_document object_deleted: doc_uuid=%s object_key=%s aux_keys=%s",
                 document_uuid,
-                file_path,
+                info["object_key"],
+                deleted_aux_keys,
+            )
+        except Exception:
+            logger.exception(
+                "delete_document object_delete_failed: doc_uuid=%s object_key=%s",
+                document_uuid,
+                info["object_key"],
             )
             return False, "file_delete_failed"
-    else:
-        logger.info("delete_document no_file: doc_uuid=%s", document_uuid)
-
-    def _unlink_path(path: str) -> bool:
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-                deleted_paths.append(path)
-            return True
-        except OSError:
-            logger.error(
-                "delete_document file_delete_failed: doc_uuid=%s path=%s",
-                document_uuid,
-                path,
-            )
-            return False
-
-    if info and info.get("file_name"):
-        doc_uuid = str(document_uuid)
-        base_dir = Path(file_path).parent if file_path else None
-        upload_root = (Path.cwd() / "upload").resolve()
-        targets = []
-        if base_dir:
-            targets.extend(
-                [
-                    base_dir / "html" / f"{doc_uuid}.html",
-                    base_dir / "md" / f"{doc_uuid}.md",
-                    base_dir / "imgs" / doc_uuid,
-                    base_dir / "tbls" / doc_uuid,
-                ]
-            )
-        targets.extend(
-            [
-                upload_root / "html" / f"{doc_uuid}.html",
-                upload_root / "md" / f"{doc_uuid}.md",
-                upload_root / "imgs" / doc_uuid,
-                upload_root / "tbls" / doc_uuid,
-            ]
-        )
-        for target in targets:
-            if target.exists() and target.is_dir():
-                for child in target.iterdir():
-                    if not _unlink_path(str(child)):
-                        return False, "file_delete_failed"
-                try:
-                    target.rmdir()
-                    deleted_paths.append(str(target))
-                except OSError:
-                    logger.error(
-                        "delete_document dir_delete_failed: doc_uuid=%s path=%s",
-                        document_uuid,
-                        target,
-                    )
-                    return False, "file_delete_failed"
-            else:
-                if not _unlink_path(str(target)):
-                    return False, "file_delete_failed"
-        if deleted_paths:
-            logger.info(
-                "delete_document aux_files_deleted: doc_uuid=%s paths=%s",
-                document_uuid,
-                deleted_paths,
-            )
 
     async with db.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute(
@@ -4163,6 +4411,11 @@ async def enqueue_document_pipeline_async(
             "file_name": item.file_name or "",
             "file_type": item.file_type or "",
             "file_size": str(item.file_size or 0),
+            "storage_type": item.storage_type or "object_storage",
+            "storage_provider": item.storage_provider or "",
+            "object_key": item.object_key or "",
+            "bucket_name": item.bucket_name or "",
+            "object_name": item.object_name or "",
             "uploaded_at": (
                 item.uploaded_at.isoformat()
                 if item.uploaded_at is not None

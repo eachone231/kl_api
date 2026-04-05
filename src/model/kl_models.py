@@ -270,14 +270,51 @@ class SystemVdbPatchRequest(BaseModel):
     token: str | None = None
 
 
+class ObjectStorageProfileItem(BaseModel):
+    id: int | None = None
+    provider: str | None = None
+    profile_name: str | None = None
+    endpoint: str | None = None
+    bucket_name: str | None = None
+    region: str | None = None
+    base_prefix: str | None = None
+    use_ssl: bool | None = None
+    access_key: str | None = None
+    secret_key: str | None = None
+    force_path_style: bool | None = None
+    is_active: bool | None = None
+
+
 class Cabinet(BaseModel):
     id: int
     project_id: int
     cabinet_uuid: str
     name: str
-    storage_type: str
-    storage_base_path: str
-    storage_path: str | None = None
+    storage_type: str | None = None
+    object_storage_profile: ObjectStorageProfileItem | None = None
+    vector_store: str | None = None
+    collection_name: str | None = None
+    system_profile: SystemProfileItem | None = None
+    is_active: bool | None = None
+
+
+class CabinetStorageProfileResponse(BaseModel):
+    storage_provider: str | None = None
+    storage_endpoint: str | None = None
+    storage_use_ssl: bool | None = None
+    storage_path_style: bool | None = None
+    storage_region: str | None = None
+    storage_bucket_name: str | None = None
+    storage_base_prefix: str | None = None
+    storage_access_key: str | None = None
+
+
+class CabinetItemResponse(BaseModel):
+    id: int
+    project_id: int
+    cabinet_uuid: str
+    name: str
+    storage_profile: CabinetStorageProfileResponse | None = None
     vector_store: str | None = None
     collection_name: str | None = None
     system_profile: SystemProfileItem | None = None
@@ -285,11 +322,11 @@ class Cabinet(BaseModel):
 
 
 class CabinetsResponse(BaseModel):
-    items: list[Cabinet]
+    items: list[CabinetItemResponse]
 
 
 class CabinetResponse(BaseModel):
-    item: Cabinet
+    item: CabinetItemResponse
 
 
 class CabinetDeleteRequest(BaseModel):
@@ -304,9 +341,7 @@ class CabinetUpdateRequest(BaseModel):
     project_id: int
     cabinet_uuid: str
     name: str
-    storage_type: str
-    storage_base_path: str
-    storage_path: str
+    storage_type: str | None = None
     vector_store: str
     collection_name: str
     system_profile_id: int
@@ -316,9 +351,7 @@ class CabinetUpdateRequest(BaseModel):
 class CabinetCreateRequest(BaseModel):
     project_id: int
     name: str
-    storage_type: str
-    storage_base_path: str
-    storage_path: str
+    storage_type: str | None = None
     vector_store: str
     collection_name: str
     system_profile_id: int
@@ -394,6 +427,11 @@ class DocumentListItem(BaseModel):
     file_name: str
     file_type: str
     file_size: int
+    storage_type: str | None = None
+    storage_provider: str | None = None
+    object_key: str | None = None
+    bucket_name: str | None = None
+    object_name: str | None = None
     status: str
     processing_step: str | None = None
     chunking_run_id: int | None = None
