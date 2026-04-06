@@ -186,6 +186,15 @@ api_router = APIRouter()
 _RESOURCE_DIR = Path(__file__).resolve().parents[1] / "resources"
 
 
+def _mask_partial_secret(value: str | None) -> str | None:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    if len(normalized) <= 6:
+        return "*" * len(normalized)
+    return f"{normalized[:4]}{'*' * (len(normalized) - 6)}{normalized[-2:]}"
+
+
 def _to_cabinet_response_item(cabinet) -> CabinetItemResponse:
     profile = cabinet.object_storage_profile
     storage_profile = None
@@ -884,7 +893,26 @@ async def delete_embedding_model_config(
 async def get_storages(
     db: aiomysql.Connection = Depends(async_get_db),
 ):
-    return StoragesResponse(items=["minio"])
+    return StoragesResponse(
+        items=[
+            {
+                "storage_provider": str(settings.storage_provider or "").strip() or None,
+                "storage_endpoint": str(settings.storage_endpoint or "").strip() or None,
+                "storage_use_ssl": bool(settings.storage_use_ssl),
+                "storage_path_style": bool(settings.storage_path_style),
+                "storage_region": str(settings.storage_region or "").strip() or None,
+                "storage_bucket_name": str(settings.storage_bucket_name or "").strip()
+                or None,
+                "storage_base_prefix": str(settings.storage_base_prefix or "").strip()
+                or None,
+                "storage_access_key": str(settings.storage_access_key or "").strip()
+                or None,
+                "storage_secret_key": _mask_partial_secret(
+                    settings.storage_secret_key
+                ),
+            }
+        ]
+    )
 
 
 @api_router.get(
@@ -921,7 +949,7 @@ async def get_system_vdb(
             "vector_store": profile.get("vector_store", ""),
             "host": profile.get("host", ""),
             "port": profile.get("port", ""),
-            "token": profile.get("token", ""),
+            "token": _mask_partial_secret(profile.get("token")),
             "updated_at": profile.get("updated_at", ""),
         }
     return response

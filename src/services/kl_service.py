@@ -987,18 +987,24 @@ async def delete_embedding_model_config_async(
     return True
 
 
-async def fetch_vector_stores_async(db) -> list[str]:
+async def fetch_vector_stores_async(db) -> list[dict[str, object]]:
     import aiomysql
 
     qry = """
-    SELECT vector_store
+    SELECT vector_store, is_active
     FROM vector_stores
     ORDER BY vector_store
     """
     async with db.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute(qry)
         rows = await cursor.fetchall()
-    return [row["vector_store"] for row in rows]
+    return [
+        {
+            "vector_store": row["vector_store"],
+            "is_active": bool(row["is_active"]),
+        }
+        for row in rows
+    ]
 
 
 async def fetch_system_secret_async(

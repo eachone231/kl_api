@@ -197,12 +197,29 @@ class EmbeddingModelConfigDeleteResponse(BaseModel):
     deleted: bool
 
 
+class StorageItem(BaseModel):
+    storage_provider: str | None = None
+    storage_endpoint: str | None = None
+    storage_use_ssl: bool | None = None
+    storage_path_style: bool | None = None
+    storage_region: str | None = None
+    storage_bucket_name: str | None = None
+    storage_base_prefix: str | None = None
+    storage_access_key: str | None = None
+    storage_secret_key: str | None = None
+
+
 class StoragesResponse(BaseModel):
-    items: list[str]
+    items: list[StorageItem]
+
+
+class VectorStoreItem(BaseModel):
+    vector_store: str
+    is_active: bool
 
 
 class VectorStoresResponse(BaseModel):
-    items: list[str]
+    items: list[VectorStoreItem]
 
 
 class SystemSecretViewRequest(BaseModel):
